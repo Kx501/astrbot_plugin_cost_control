@@ -280,7 +280,7 @@ def test_collect_response_deepseek_miss_not_double_billed():
     """DeepSeek miss token 只按 input_other 收一次，不再冒充 cache_creation 加收。"""
     import asyncio
 
-    user = {"prov": {"mode": "per_token", "input": 1.0, "output": 2.0}}
+    user = {"prov": {"mode": "per_token", "input": 1.0, "input_cached": 0.1, "output": 2.0}}
     host = _CollectHost({"user": user})
     # AstrBot openai_source 映射：input_other = prompt_tokens - 0 = hit(80)+miss(20)
     resp = SimpleNamespace(
@@ -297,8 +297,10 @@ def test_collect_response_deepseek_miss_not_double_billed():
     rec = asyncio.run(host.collect_response(SimpleNamespace(unified_msg_origin="u"), resp))
     assert rec["cache_read"] == 80
     assert rec["cache_creation"] is None
-    # 修复前：cache_creation=20 会让成本按 (100 + 20×1.0) / 1M 收 ≈ 2 倍
-    assert rec["cost_amount"] == pytest.approx(100 / 1_000_000)
+    assert rec["token_input_other"] == 20
+    assert rec["token_input_cached"] == 80
+    # miss 按输入价，hit 按缓存价，输入总量仍然是 100。
+    assert rec["cost_amount"] == pytest.approx((20 + 80 * 0.1) / 1_000_000)
 
 
 def test_collect_response_expr_failure_records_class_not_silent(caplog):
@@ -405,3 +407,115 @@ def test_collect_response_created_datetime_reaches_time_funcs(monkeypatch):
     rec = asyncio.run(host.collect_response(NS(unified_msg_origin="u"), resp))
     # p=100k × 3 → $0.3；若 datetime 未被消费则回退 now()（非 2023-11）得 ×1
     assert rec["cost_amount"] == pytest.approx(0.3)
+
+
+def test_cache_dict_payload_and_invalid_field_do_not_hide_valid_usage():
+    raw = {
+        "usage": {
+            "cache_creation_input_tokens": "bad",
+            "cache_read_input_tokens": 250,
+            "cache_creation": {"ephemeral_1h_input_tokens": 100},
+        }
+    }
+    cc, cr, usage, cc1h = _extract_cache(raw)
+    assert (cc, cr, cc1h) == (None, 250, 100)
+    assert usage == raw["usage"]
+    assert _extract_cache({"usage": {"input_tokens_details": {"cached_tokens": 123}}})[1] == 123
+
+
+def test_usage_normalization_preserves_totals_and_existing_cache_breakdown():
+    from cost_control.supplement import _normalize_usage
+
+    assert _normalize_usage(SimpleNamespace(input_other=100, input_cached=0, output=5), 80) == (
+        20,
+        80,
+        5,
+    )
+    assert _normalize_usage(SimpleNamespace(input_other=20, input_cached=80, output=5), 80) == (
+        20,
+        80,
+        5,
+    )
+    assert _normalize_usage(SimpleNamespace(input_other=20, input_cached=0), 80) == (20, 0, 0)
+
+
+async def test_response_uses_requested_model_and_provider_snapshot():
+    host = _CollectHost(
+        {
+            "user": {
+                "prov|override": {"mode": "per_turn", "price": 2},
+                "changed": {"mode": "per_turn", "price": 99},
+            }
+        }
+    )
+    event = SimpleNamespace()
+    host.record_request_provider(event, SimpleNamespace(model="override"))
+    host.context.get_using_provider = lambda umo: SimpleNamespace(
+        meta=lambda: SimpleNamespace(id="changed", model="other-model")
+    )
+    record = await host.collect_response(event, SimpleNamespace(raw_completion={"id": "raw-id"}))
+    assert record["provider_id"] == "prov"
+    assert record["provider_model"] == "override"
+    assert record["cost_amount"] == 2
+    assert record["response_id"] == "raw-id"
+
+
+def test_active_agent_usage_checks_event_identity_and_reads_cumulative_tokens(monkeypatch):
+    import sys
+    import types
+
+    from cost_control.supplement import _active_agent_usage
+
+    event = SimpleNamespace(unified_msg_origin="u")
+    usage = SimpleNamespace(input_other=1200, input_cached=400, output=300)
+    runner = SimpleNamespace(
+        run_context=SimpleNamespace(context=SimpleNamespace(event=event)),
+        stats=SimpleNamespace(token_usage=usage),
+    )
+    module = types.ModuleType("astrbot.core.pipeline.process_stage.follow_up")
+    module._ACTIVE_AGENT_RUNNERS = {"u": runner}
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    assert _active_agent_usage(event) == (1200, 400, 300)
+    assert _active_agent_usage(SimpleNamespace(unified_msg_origin="u")) is None
+
+
+async def test_collection_includes_prior_tool_loop_usage_without_replacing_cached_total(
+    monkeypatch,
+):
+    import sys
+    import types
+
+    event = SimpleNamespace(unified_msg_origin="u", _cost_control_provider=("p", "m"))
+    usage = SimpleNamespace(input_other=1200, input_cached=400, output=300)
+    runner = SimpleNamespace(
+        run_context=SimpleNamespace(context=SimpleNamespace(event=event)),
+        stats=SimpleNamespace(token_usage=usage),
+    )
+    module = types.ModuleType("astrbot.core.pipeline.process_stage.follow_up")
+    module._ACTIVE_AGENT_RUNNERS = {"u": runner}
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    host = SupplementMixin()
+    host.get_pricing = lambda: {"user": {"p": {"mode": "per_token", "input": 1}}}
+    response = SimpleNamespace(
+        usage=SimpleNamespace(input_other=200, input_cached=100, output=50),
+        raw_completion={
+            "usage": {"cache_read_input_tokens": 100, "cache_creation_input_tokens": 10}
+        },
+    )
+    record = await host.collect_response(event, response)
+    assert (record["token_input_other"], record["token_input_cached"], record["token_output"]) == (
+        1200,
+        400,
+        300,
+    )
+    assert record["cache_read"] == 400
+    assert record["raw_usage"]["cache_read_input_tokens"] == 100
+    assert record["billing_context"]["collection"]["raw_usage_scope"] == "final_response"
+    assert usage.input_other == 1200  # never mutate shared runner stats
+
+
+async def test_captured_provider_with_unknown_model_falls_back_to_response_model():
+    host = _CollectHost({})
+    event = SimpleNamespace(_cost_control_provider=("captured", None))
+    provider_id, model = await host._get_provider_info("u", {"model": "actual"}, event=event)
+    assert (provider_id, model) == ("captured", "actual")

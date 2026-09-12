@@ -8,8 +8,8 @@
 1. **局部阈值**（``budget_overrides``）：按配置顺序扫每条启用的规则，第一条匹配
    当前请求（umo / provider / user）的规则生效。若其 token_limit 或 cost_limit
    任一超限 → 立即返回 ``{exceeded: True, dim: "override:<idx>", ...}``。
-2. **全局 5 维**（``budgets`` / ``budgets_cost``）：未匹配 override 或 override 未
-   超限时按 ``_DIM_ORDER`` 顺序逐维比较。
+2. **全局 5 维**（``budgets`` / ``budgets_cost``）：未匹配 override 时按
+   ``_DIM_ORDER`` 顺序逐维比较。首条匹配的局部规则替代全局预算。
 3. **默认处理**：全局超限时使用 ``default_on_exceeded``（``"stop" | "fallback" |
    "warn"``）；override 超限时直接用 override 自身的 ``on_exceeded``。
 
@@ -26,6 +26,7 @@
 
 from __future__ import annotations
 
+import inspect
 from collections.abc import Mapping
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -72,8 +73,10 @@ def day_window_start(refresh_time: str, now_utc: datetime, tz: ZoneInfo) -> date
         # 非法时刻（如 25:00）不得让 replace() 抛异常拖垮整个预算检查。
         hh, mm = 0, 0
     now_local = now_utc.astimezone(tz)
-    start_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0)
-    if start_local > now_local:
+    start_local = now_local.replace(hour=hh, minute=mm, second=0, microsecond=0, fold=0)
+    # DST 回拨的重复时刻取第一次；跳时产生的不存在时刻按 UTC 归一化后判断，
+    # 不能直接比较同一 ZoneInfo 的本地墙上时间，否则可能返回未来的窗口起点。
+    if start_local.astimezone(UTC) > now_utc:
         start_local -= timedelta(days=1)
     return start_local.astimezone(UTC)
 
@@ -171,7 +174,7 @@ def truncate_contexts(contexts: Any, token_limit: int) -> list[Any]:
     total = 0
     for c in reversed(items):
         est = _str_tokens(str(c))
-        if kept and total + est > token_limit:
+        if total + est > token_limit:
             break
         kept.append(c)
         total += est
@@ -479,7 +482,6 @@ class BudgetMixin:
 
             # ===== 1. 局部阈值（override）=====
             if overrides:
-                pricing = self.get_pricing()
                 for idx, ov in enumerate(overrides):
                     matched = match_override(ov, umo, user_id, provider_id)
                     if matched is None:
@@ -488,10 +490,11 @@ class BudgetMixin:
                     lt = float(ov.get("token_limit") or 0)
                     lc = float(ov.get("cost_limit") or 0)
                     if lt <= 0 and lc <= 0:
-                        # 规则未设上限，视为不限制；继续检查下一条规则 / 全局。
-                        continue
+                        # 首条匹配规则明确不限额，同样覆盖后续规则与全局默认预算。
+                        return zero
                     used_t = 0.0
                     used_c = 0.0
+                    pricing = self.get_pricing() if lc > 0 else {}
                     if lt > 0:
                         used_t = await self._override_used(
                             ov, "token", umo, model, user_id, provider_id, d_start, pricing
@@ -636,7 +639,7 @@ class BudgetMixin:
             result = check_dimensions_dual(used_t_map, used_c_map, limits_t, limits_c)
             result["on_exceeded"] = default_on_exceeded(cfg)
             result["currency"] = main_cur
-            result["fallback_provider_ids"] = []
+            result["fallback_provider_ids"] = [p["id"] for p in get_fallback_providers(cfg)]
             result["fallback_token_limit"] = 0
             result["stop_message"] = ""
             result["rule_idx"] = -1
@@ -750,6 +753,15 @@ class BudgetMixin:
             except Exception as e:
                 logger.warning("[cost_control] fallback provider %s 调用失败: %s", pid, e)
                 continue
+            # 空文本响应（例如工具调用）也可能产生费用，必须在决定是否尝试
+            # 下一备用 Provider 前记录，避免从统计中漏掉已完成的调用。
+            try:
+                await self._record_fallback(event, prov, pid, resp)
+            except Exception as e:
+                logger.warning("[cost_control] fallback 记录失败: %s", e)
+            if getattr(resp, "role", None) == "err":
+                logger.warning("[cost_control] fallback provider %s 返回错误响应", pid)
+                continue
             text = ""
             try:
                 text = (getattr(resp, "completion_text", None) or "").strip()
@@ -757,10 +769,6 @@ class BudgetMixin:
                 text = ""
             if not text:
                 continue
-            try:
-                await self._record_fallback(event, prov, pid, resp)
-            except Exception as e:
-                logger.warning("[cost_control] fallback 记录失败: %s", e)
             try:
                 event.stop_event()
             except Exception:
@@ -779,12 +787,22 @@ class BudgetMixin:
         prompt = getattr(req, "prompt", "") or ""
         system_prompt = getattr(req, "system_prompt", "") or ""
         contexts = truncate_contexts(getattr(req, "contexts", None), token_limit)
+        kwargs = {"prompt": prompt, "system_prompt": system_prompt, "contexts": contexts}
+        for field in ("image_urls", "audio_urls", "extra_user_content_parts"):
+            value = getattr(req, field, None)
+            if value:
+                kwargs[field] = value
+        # 兼容旧 Provider 签名必须在调用前判断；Provider 内部 TypeError 可能发生在
+        # 已发出付费请求后，捕获后重试会造成重复计费。
         try:
-            return await prov.text_chat(
-                prompt=prompt, system_prompt=system_prompt, contexts=contexts
-            )
-        except TypeError:
-            return await prov.text_chat(prompt=prompt, system_prompt=system_prompt)
+            parameters = inspect.signature(prov.text_chat).parameters
+        except (TypeError, ValueError):
+            parameters = None
+        if parameters is not None and not any(
+            p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters.values()
+        ):
+            kwargs = {key: value for key, value in kwargs.items() if key in parameters}
+        return await prov.text_chat(**kwargs)
 
     async def _record_fallback(
         self,
@@ -800,16 +818,15 @@ class BudgetMixin:
         from .supplement import (
             _extract_billing_context,
             _extract_cache,
+            _normalize_usage,
             _read_request_id,
             _safe_sender_id,
         )
 
         usage = getattr(resp, "usage", None)
-        token_input_other = int(getattr(usage, "input_other", 0) or 0)
-        token_input_cached = int(getattr(usage, "input_cached", 0) or 0)
-        token_output = int(getattr(usage, "output", 0) or 0)
         raw = getattr(resp, "raw_completion", None)
         cache_creation, cache_read, raw_usage, cache_creation_1h = _extract_cache(raw)
+        token_input_other, token_input_cached, token_output = _normalize_usage(usage, cache_read)
         billing_context = _extract_billing_context(raw, cache_creation_1h)
         params = billing_context.get("params") if isinstance(billing_context, dict) else None
         params = params if isinstance(params, dict) else {}
@@ -825,6 +842,10 @@ class BudgetMixin:
             provider_model = str(getattr(meta, "model", "") or "")
         except Exception:
             pass
+        try:
+            provider_model = str(prov.get_model() or provider_model)
+        except Exception:
+            pass
 
         umo = str(
             getattr(event, "unified_msg_origin", None) or getattr(event, "session_id", None) or ""
@@ -832,6 +853,28 @@ class BudgetMixin:
 
         # 固化原始货币成本金额与符号。
         created = datetime.now(UTC)
+        # 直接 text_chat 不经过 AstrBot agent pipeline，不会自动写 ProviderStat。
+        # 补一条原生统计后，后续全局/会话/模型预算与报表才能看到降级费用。
+        try:
+            db = self.context.get_db()
+            native = await db.insert_provider_stat(
+                umo=umo,
+                provider_id=provider_id,
+                provider_model=provider_model or None,
+                conversation_id=getattr(event, "conversation_id", None),
+                status="error" if getattr(resp, "role", None) == "err" else "completed",
+                stats={
+                    "token_usage": {
+                        "input_other": token_input_other,
+                        "input_cached": token_input_cached,
+                        "output": token_output,
+                    }
+                },
+                agent_type="cost_control_fallback",
+            )
+            created = getattr(native, "created_at", None) or created
+        except Exception as e:
+            logger.warning("[cost_control] fallback 原生统计写入失败: %s", e)
         usage_dict = {
             "token_input_other": token_input_other,
             "token_input_cached": token_input_cached,
@@ -855,8 +898,9 @@ class BudgetMixin:
                 provider_id or "-",
                 provider_model or "-",
             )
-        except Exception:
-            raw_cost, cur = 0.0, "USD"
+        except Exception as e:
+            raw_cost, cur = None, "USD"
+            logger.warning("[cost_control] fallback 成本计算失败: %s", e)
 
         record = {
             "umo": umo,

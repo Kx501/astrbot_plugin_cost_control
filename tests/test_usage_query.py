@@ -174,3 +174,106 @@ async def test_cost_rows_keep_minute_only_for_scheduled_providers():
     assert plain[0]["token_input_other"] == 70
     assert plain[0]["created_at"] is None
     await engine.dispose()
+
+
+def test_bucketize_invalid_timestamp_is_skipped_and_offsets_use_utc():
+    rows = [
+        SimpleNamespace(created_at="not a date", token_output=100),
+        SimpleNamespace(created_at="2026-06-02T00:30:00+08:00", token_output=5),
+    ]
+    assert bucketize_rows(rows, "hour") == [
+        {
+            "bucket": "2026-06-01 16:00",
+            "token_input_other": 0,
+            "token_input_cached": 0,
+            "token_output": 5,
+            "count": 1,
+        }
+    ]
+
+
+async def test_nonlinear_cost_queries_preserve_individual_calls_and_filter_window(tmp_path):
+    from astrbot.core.db.po import ProviderStat
+    from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+    from sqlmodel import SQLModel
+
+    from cost_control.cost import compute_cost_grouped
+    from cost_control.usage_query import UsageQueryMixin
+
+    engine = create_async_engine(f"sqlite+aiosqlite:///{tmp_path / 'nonlinear.db'}")
+    try:
+        async with engine.begin() as conn:
+            await conn.run_sync(
+                lambda sync_conn: SQLModel.metadata.create_all(
+                    sync_conn, tables=[ProviderStat.__table__]
+                )
+            )
+        maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+        stamp = datetime(2026, 8, 31, 1, 0, tzinfo=UTC)
+        async with maker() as session:
+            session.add_all(
+                [
+                    ProviderStat(
+                        umo="u",
+                        provider_id="expr",
+                        provider_model="m",
+                        token_input_other=60,
+                        created_at=stamp,
+                    ),
+                    ProviderStat(
+                        umo="u",
+                        provider_id="expr",
+                        provider_model="m",
+                        token_input_other=60,
+                        created_at=stamp,
+                    ),
+                    ProviderStat(
+                        umo="other",
+                        provider_id="expr",
+                        provider_model="m",
+                        token_input_other=900,
+                        created_at=stamp,
+                    ),
+                    ProviderStat(
+                        umo="u",
+                        provider_id="expr",
+                        provider_model="m",
+                        token_input_other=900,
+                        created_at=datetime(2026, 8, 30, tzinfo=UTC),
+                    ),
+                    ProviderStat(
+                        umo="u",
+                        provider_id="plain",
+                        provider_model="m",
+                        token_input_other=20,
+                        created_at=stamp,
+                    ),
+                    ProviderStat(
+                        umo="u",
+                        provider_id="plain",
+                        provider_model="m",
+                        token_input_other=20,
+                        created_at=stamp,
+                    ),
+                ]
+            )
+            await session.commit()
+        query = UsageQueryMixin()
+        query.context = SimpleNamespace(get_db=lambda: SimpleNamespace(get_db=maker))
+        pricing = {
+            "user": {
+                "expr": {"mode": "tiered_expr", "expr": "p < 100 ? p : p * 10"},
+                "plain": {"mode": "per_token", "input": 1},
+            }
+        }
+        for rows in (
+            await query.query_usage_cost_rows(pricing, start=stamp, umo="u"),
+            await query.query_usage_cost_timeseries(pricing, start=stamp, umo="u"),
+        ):
+            expr_rows = [row for row in rows if row["provider_id"] == "expr"]
+            assert len(expr_rows) == 2
+            assert all(row["created_at"] == stamp for row in expr_rows)
+            assert sum(row["count"] for row in rows) == 4
+            assert abs(compute_cost_grouped(rows, pricing) - 0.00016) < 1e-9
+    finally:
+        await engine.dispose()

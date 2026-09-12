@@ -53,7 +53,7 @@ export function BudgetsView({ refreshNonce }: { refreshNonce: number }) {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
-    if (!data) return;
+    if (!data || (ready && isDirty())) return;
     setTokens({ ...(data.limits || {}) });
     setCost({ ...(data.limits_cost || {}) });
     setCostCurrency({ ...(data.limits_cost_currency || {}) });
@@ -123,7 +123,7 @@ export function BudgetsView({ refreshNonce }: { refreshNonce: number }) {
     [tokens, cost, costCurrency, overrides, fallbacks, defaultOn],
   );
 
-  const { status, error } = useAutoSave(
+  const { status, error, isDirty } = useAutoSave(
     payload,
     async (p) => {
       void (await api.postSaveConfig(p));

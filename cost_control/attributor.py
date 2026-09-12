@@ -27,6 +27,7 @@ head 存、tail 取删。asyncio 单线程且 head→tail 在同一 ``call_event
 
 from __future__ import annotations
 
+import json
 import zlib
 from typing import Any
 
@@ -124,6 +125,8 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     for m in messages or []:
         if isinstance(m, dict):
             total += _content_tokens(m.get("content"))
+            if m.get("tool_calls"):
+                total += _str_tokens(json.dumps(m["tool_calls"], ensure_ascii=False, default=str))
             # role 开销忽略不计
     return total
 
@@ -137,13 +140,18 @@ def _tool_tokens(func_tool: Any) -> int:
     if func_tool is None:
         return 0
     try:
+        schema = getattr(func_tool, "openai_schema", None)
+        if callable(schema):
+            tools_schema = schema()
+            return _str_tokens(json.dumps(tools_schema, ensure_ascii=False)) if tools_schema else 0
         tools = getattr(func_tool, "tools", None)
         if tools:
             buf: list[str] = []
             for t in tools:
                 name = getattr(t, "name", "") or ""
                 desc = getattr(t, "description", "") or ""
-                buf.append(f"{name}: {desc}")
+                params = getattr(t, "parameters", {})
+                buf.append(f"{name}: {desc} {json.dumps(params, ensure_ascii=False)}")
             return _str_tokens("\n".join(buf))
     except Exception:
         pass
@@ -255,13 +263,19 @@ class AttributorMixin:
         """
         self.__init_attribution__()
         try:
+            self._attr_snapshots.pop(id(req), None)
             if not self._attribution_enabled() or not self._attribution_sampled(req):
                 return
+            # 被其他插件中止的请求可能不经过 tail；限制孤立快照数量。
+            if len(self._attr_snapshots) >= 1024:
+                self._attr_snapshots.pop(next(iter(self._attr_snapshots)))
             self._attr_snapshots[id(req)] = self.snapshot_context(req)
         except Exception:
             pass
 
-    def pop_injection(self, req: ProviderRequest, umo: str) -> dict[str, Any] | None:
+    def pop_injection(
+        self, req: ProviderRequest, umo: str, *, event: Any = None
+    ) -> dict[str, Any] | None:
         """tail 钩子调用：取出初始快照，与最终快照对比，返回注入归因。
 
         Args:
@@ -278,8 +292,10 @@ class AttributorMixin:
         """
         self.__init_attribution__()
         try:
+            if event is not None:
+                event._cost_control_injection = None
             initial = self._attr_snapshots.pop(id(req), None)
-            if initial is None:
+            if initial is None or not self._attribution_enabled():
                 return None
             final = self.snapshot_context(req)
             injected = {
@@ -296,6 +312,8 @@ class AttributorMixin:
             if umo:
                 self._attr_last[umo] = result
                 self._last_sp[umo] = getattr(req, "system_prompt", "") or ""
+            if event is not None:
+                event._cost_control_injection = result
             return result
         except Exception:
             return None

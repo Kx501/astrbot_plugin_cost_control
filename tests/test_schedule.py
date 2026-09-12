@@ -156,3 +156,52 @@ def test_grouped_cost_uses_host_effective_pricing(monkeypatch, tmp_path: Path) -
     query = observed["query"]
     assert isinstance(query, dict)
     assert query["by"] == "provider_model"
+
+
+def test_disabled_plugin_does_not_send_reports_or_sync_prices(tmp_path, monkeypatch):
+    host = _ScheduleHost(cfg={"enabled": False}, data_dir=tmp_path)
+    calls = []
+
+    async def query(**kwargs):
+        calls.append("query")
+        return {}
+
+    async def sync(*args, **kwargs):
+        calls.append("sync")
+        return {}
+
+    host.query_usage = query
+    monkeypatch.setattr("cost_control.price_sources.sync_all", sync)
+    asyncio.run(host.daily_report())
+    asyncio.run(host.sync_prices())
+    assert calls == []
+
+
+async def test_unregister_cron_only_removes_jobs_owned_by_this_instance(tmp_path):
+    host = _ScheduleHost(cfg={"schedule": {"enable_daily_report": True}}, data_dir=tmp_path)
+
+    async def add(**kwargs):
+        return SimpleNamespace(job_id=kwargs["name"] + "-owned")
+
+    host.cron.add_basic_job = add
+    await host.register_cron()
+    owned = set(host._cron_job_ids)
+    assert len(owned) == 2
+    await host.unregister_cron()
+    await host.unregister_cron()
+    assert set(host.cron.deleted) == owned
+    assert len(host.cron.deleted) == len(owned)
+    assert host._cron_closed is True
+
+
+async def test_cron_registration_finishing_after_unload_is_removed(tmp_path):
+    host = _ScheduleHost(cfg={}, data_dir=tmp_path)
+
+    async def add(**kwargs):
+        await host.unregister_cron()
+        return SimpleNamespace(job_id="late")
+
+    host.cron.add_basic_job = add
+    await host.register_cron()
+    assert host.cron.deleted == ["late"]
+    assert host._cron_job_ids == set()

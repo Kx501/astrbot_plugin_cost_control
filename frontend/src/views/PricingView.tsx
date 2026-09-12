@@ -103,6 +103,8 @@ export function PricingView({ refreshNonce }: { refreshNonce: number }) {
 
   useEffect(() => {
     if (!data) return;
+    // Background source/selection refreshes must not replace a draft being saved.
+    if (ready && isDirty()) return;
     const next: Record<string, DraftEntry> = {};
     const userPricing = data.user_pricing || {};
     for (const [pid, entry] of Object.entries(userPricing)) {
@@ -345,7 +347,7 @@ export function PricingView({ refreshNonce }: { refreshNonce: number }) {
   const collectMultipliers = (): Record<string, number> => {
     const out: Record<string, number> = {};
     for (const [clusterId, raw] of Object.entries(multiplierDrafts)) {
-      const multiplier = Number(raw);
+      const multiplier = Number(raw.trim() || "1");
       if (
         !Number.isFinite(multiplier) ||
         multiplier < 0 ||
@@ -390,7 +392,7 @@ export function PricingView({ refreshNonce }: { refreshNonce: number }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drafts, multiplierDrafts, scheduleDrafts]);
 
-  const { status, error, flush } = useAutoSave(
+  const { status, error, flush, isDirty } = useAutoSave(
     payload,
     async (p) => {
       if (p.error) throw new Error(p.error);
@@ -443,10 +445,7 @@ export function PricingView({ refreshNonce }: { refreshNonce: number }) {
   };
   const toggleAutoSync = async (enabled: boolean) => {
     try {
-      const cfg = await api.getConfig();
-      const priceSync = { ...((cfg.price_sync as Record<string, unknown>) ?? {}) };
-      priceSync.auto_enabled = enabled;
-      await api.postSaveConfig({ price_sync: priceSync });
+      await api.postSaveConfig({ price_sync: { auto_enabled: enabled } });
       setAutoSync(enabled);
       setSyncMsg(enabled ? "已启用每日自动同步" : "已关闭每日自动同步");
     } catch (e) {
@@ -456,16 +455,7 @@ export function PricingView({ refreshNonce }: { refreshNonce: number }) {
   // 源开关：读最新 config → 改 price_sources → 保存 → 启用时立即拉该源
   const toggleSource = async (sourceId: string, enabled: boolean) => {
     try {
-      const cfg = await api.getConfig();
-      const ps = { ...((cfg.price_sources as Record<string, unknown>) ?? {}) };
-      const entry = { ...((ps[sourceId] as Record<string, unknown>) ?? {}) };
-      entry.enabled = enabled;
-      if (sourceId.startsWith("newapi:") && !entry.provider_id) {
-        entry.provider_id = sourceId.slice(7);
-        entry.use_provider_key = true;
-      }
-      ps[sourceId] = entry;
-      await api.postSaveConfig({ price_sources: ps });
+      await api.postPriceSource(sourceId, { enabled });
       if (enabled) {
         await doSync([sourceId]);
       } else {
@@ -485,18 +475,14 @@ export function PricingView({ refreshNonce }: { refreshNonce: number }) {
         setSyncMsg(`❌ ${pid} 未检测到 New API /api/pricing 接口`);
         return;
       }
-      const cfg = await api.getConfig();
-      const ps = { ...((cfg.price_sources as Record<string, unknown>) ?? {}) };
-      // URL 去重：同 base_url 只建一个源；首次以 provider 短名作默认名，可后续重命名
-      const sid = det.existing_source || `newapi:${shortName(pid)}`;
-      ps[sid] = {
-        ...(ps[sid] as Record<string, unknown> | undefined),
+      // 同 base_url 复用已有源；完整 provider_id 避免供应商短名冲突。
+      const sid = det.existing_source || `newapi:${pid}`;
+      await api.postPriceSource(sid, {
         enabled: true,
-        provider_id: (ps[sid] as { provider_id?: string } | undefined)?.provider_id ?? pid,
+        provider_id: pid,
         base_url: det.base_url ?? "",
         use_provider_key: true,
-      };
-      await api.postSaveConfig({ price_sources: ps });
+      });
       setSyncMsg(
         det.existing_source
           ? `✅ ${pid} 复用已有源 ${sid}，正在拉取价格…`
@@ -583,7 +569,9 @@ export function PricingView({ refreshNonce }: { refreshNonce: number }) {
   const newApiSourceFor = (pid: string) => {
     for (const sid of [`newapi:${shortName(pid)}`, `newapi:${pid}`]) {
       const st = sources[sid];
-      if (st) return { sourceId: sid, enabled: !!st.enabled };
+      if (st && (!st.provider_id || st.provider_id === pid)) {
+        return { sourceId: sid, enabled: !!st.enabled };
+      }
     }
     for (const [sid, st] of Object.entries(sources)) {
       if (sid.startsWith("newapi:") && st.provider_id === pid) {
@@ -609,6 +597,8 @@ export function PricingView({ refreshNonce }: { refreshNonce: number }) {
     setResetArmed(false);
     setResetResult("重置中…");
     try {
+      // A confirmed reset also discards invalid drafts, after any writer settles.
+      await flush().catch(() => {});
       await api.postSaveConfig({
         pricing: {},
         pricing_schedules: {},

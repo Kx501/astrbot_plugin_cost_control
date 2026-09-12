@@ -59,6 +59,33 @@ class ScheduleMixin:
     push_to_session: Any
     get_pricing: Any
 
+    async def _add_cron_job(self, manager: Any, **kwargs: Any) -> None:
+        """保存本实例创建的 job ID，卸载时只删除自己持有的任务。"""
+        if getattr(self, "_cron_closed", False):
+            return
+        job = await manager.add_basic_job(**kwargs)
+        job_id = getattr(job, "job_id", None)
+        if job_id:
+            owned = getattr(self, "_cron_job_ids", None)
+            if owned is None:
+                owned = self._cron_job_ids = set()
+            owned.add(str(job_id))
+            if getattr(self, "_cron_closed", False):
+                await self.unregister_cron()
+
+    async def unregister_cron(self) -> None:
+        """卸载时撤销本实例的调度及宿主持有的回调引用，可重复调用。"""
+        self._cron_closed = True
+        owned = getattr(self, "_cron_job_ids", None)
+        if not owned:
+            return
+        for job_id in tuple(owned):
+            try:
+                await self.context.cron_manager.delete_job(job_id)
+                owned.discard(job_id)
+            except Exception as e:
+                logger.warning("[cost_control] 卸载 CronJob 失败 id=%s: %s", job_id, e)
+
     def _report_cron(self) -> str:
         """从 ``alerts.daily_report_time`` 解析出日报 cron 表达式。"""
         alerts = get_config(getattr(self, "cfg", None), "alerts", {}) or {}
@@ -90,7 +117,8 @@ class ScheduleMixin:
             # 仅当显式启用时才注册日报 CronJob（默认关闭，避免主动推送打扰）。
             # 历史清理 job 不发消息，始终注册。
             if enable_report:
-                await cm.add_basic_job(
+                await self._add_cron_job(
+                    cm,
                     name=REPORT_JOB_NAME,
                     cron_expression=self._report_cron(),
                     handler=self.daily_report,
@@ -99,7 +127,8 @@ class ScheduleMixin:
                     enabled=True,
                     persistent=False,
                 )
-            await cm.add_basic_job(
+            await self._add_cron_job(
+                cm,
                 name=CLEANUP_JOB_NAME,
                 cron_expression=_CLEANUP_CRON,
                 handler=self.cleanup_old,
@@ -112,7 +141,8 @@ class ScheduleMixin:
             enable_price_sync = bool(price_sync.get("auto_enabled", False))
             if enable_price_sync:
                 try:
-                    await cm.add_basic_job(
+                    await self._add_cron_job(
+                        cm,
                         name=PRICE_SYNC_JOB_NAME,
                         cron_expression=str(price_sync.get("cron") or "0 4 * * *"),
                         handler=self.sync_prices,
@@ -133,6 +163,10 @@ class ScheduleMixin:
 
     async def daily_report(self) -> None:
         """CronJob 回调：构建日报并推送给 ``alerts.daily_report_to`` 的每个会话。"""
+        if getattr(self, "_cron_closed", False) or not get_config(
+            getattr(self, "cfg", None), "enabled", True
+        ):
+            return
         try:
             now = datetime.now(UTC)
             tz = resolve_tz(self.context)
@@ -165,6 +199,10 @@ class ScheduleMixin:
 
     async def sync_prices(self) -> None:
         """CronJob 回调：同步启用的价格源；失败仅记录日志，保留旧目录。"""
+        if getattr(self, "_cron_closed", False) or not get_config(
+            getattr(self, "cfg", None), "enabled", True
+        ):
+            return
         try:
             from .price_sources import merged_provider_config, sync_all
 
@@ -195,6 +233,8 @@ class ScheduleMixin:
 
     async def cleanup_old(self) -> None:
         """CronJob 回调：按 ``schedule.retain_days`` 清理过期补充记录。"""
+        if getattr(self, "_cron_closed", False):
+            return
         try:
             sched = get_config(getattr(self, "cfg", None), "schedule", {}) or {}
             days = int(sched.get("retain_days", 0) or 0) if isinstance(sched, dict) else 0

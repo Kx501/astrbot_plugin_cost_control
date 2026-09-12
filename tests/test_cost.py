@@ -533,6 +533,50 @@ def test_per_token_explicit_zero_not_inherited():
     assert abs(cost - 9.9) < 1e-9  # output 保持 0
 
 
+def test_partial_price_inherits_in_its_own_currency():
+    from cost_control.config import get_pricing
+    from cost_control.cost import compute_cost_in_main
+
+    pricing = get_pricing(
+        {
+            "pricing": {"prov": {"input": 7.0, "currency": "CNY"}},
+            "exchange_rates": {"CNY": 7.0},
+        }
+    )
+    pricing["defaults"] = {"m": {"input": 2.0, "output": 10.0}}
+    usage = {"token_input_other": 1_000_000, "token_output": 1_000_000}
+    assert compute_cost_value(usage, "prov", "m", pricing) == 77.0
+    assert compute_cost_in_main(usage, "prov", "m", pricing, "USD", {"CNY": 7.0}) == 11.0
+
+
+@pytest.mark.parametrize("mode", ["per_token", "per_tier"])
+@pytest.mark.parametrize("cache_price, expected", [(None, 2.0), (0.0, 0.0)])
+def test_catalog_missing_cache_price_falls_back_to_input(mode, cache_price, expected):
+    catalog = {
+        "source:m": {"mode": mode, "prompt": 2.0, "completion": 3.0, "cache_read": cache_price}
+    }
+    selections = {"prov": {"m": {"price_key": "source:m"}}}
+    cost = compute_cost_value(
+        {"token_input_cached": 1_000_000}, "prov", "m", pricing_full({}, catalog, selections)
+    )
+    assert cost == expected
+
+
+def test_paid_service_tier_on_free_base_retains_price_and_cluster_multiplier():
+    catalog = {
+        "source:m": {
+            "mode": "per_tier",
+            "prompt": 0.0,
+            "service_tiers": [{"match": "priority", "prompt": 2.0}],
+        }
+    }
+    selections = {"prov": {"m": {"price_key": "source:m"}}}
+    pricing = pricing_full({}, catalog, selections)
+    pricing.update({"provider_clusters": {"prov": "cluster"}, "multipliers": {"cluster": 0.5}})
+    usage = {"token_input_other": 1_000_000, "service_tier": "priority"}
+    assert compute_cost_value(usage, "prov", "m", pricing) == 1.0
+
+
 def test_per_token_no_fallback_zero():
     # 无候选无默认 → 未配置字段按 0（旧行为）
     user = {"prov": _per_token_partial(input=9.9)}

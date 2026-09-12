@@ -28,6 +28,7 @@
 from __future__ import annotations
 
 import json
+import math
 import urllib.request
 from typing import Any
 
@@ -65,16 +66,17 @@ def fetch_models() -> dict[str, dict[str, Any]]:
 
 
 def to_usd_per_m(token_price: Any) -> float | None:
-    """USD/token → USD/百万 token（None / 非正 / 非法 → None）。"""
+    """USD/token → USD/百万 token（None / 负数 / 非有限 / 非法 → None）。"""
     if token_price is None:
         return None
     try:
         v = float(token_price)
     except (TypeError, ValueError):
         return None
-    if v <= 0:
+    if not math.isfinite(v) or v < 0:
         return None
-    return round(v * 1_000_000, 6)
+    converted = v * 1_000_000
+    return round(converted, 6) if math.isfinite(converted) else None
 
 
 def extract_prices(pricing: dict[str, Any]) -> dict[str, float]:

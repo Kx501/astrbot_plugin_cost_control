@@ -115,6 +115,15 @@ def test_sources_filter():
     assert {c.source for c in cands} == {"openrouter"}
 
 
+def test_refresh_does_not_remove_another_source_with_a_shared_prefix():
+    first = _price("newapi:gateway", "m")
+    second = _price("newapi:gateway:backup", "m")
+    cat = _catalog_with(first, second)
+    assert cat.prices_for_source(first.source) == {first.price_key: first}
+    cat.replace_source_prices(first.source, {})
+    assert cat.prices == {second.price_key: second}
+
+
 def test_candidate_cache_key_includes_limit_and_none_vs_empty_sources():
     cat = _catalog_with(
         _price("litellm", "gpt-4o"),
@@ -196,6 +205,18 @@ def test_load_missing_file_returns_empty(tmp_path):
     cat = load_catalog(str(tmp_path))
     assert isinstance(cat, PriceCatalog)
     assert cat.prices == {}
+
+
+def test_invalid_source_counters_do_not_discard_valid_price_entries(tmp_path):
+    cat = _catalog_with(_price("litellm", "m"))
+    payload = cat.to_dict()
+    payload["version"] = "invalid"
+    payload["sources"] = {"litellm": {"models": "bad-count", "skipped": -2}}
+    (tmp_path / "price_catalog.json").write_text(json.dumps(payload), encoding="utf-8")
+    loaded = load_catalog(str(tmp_path))
+    assert loaded.prices["litellm:m"].prompt == 1.0
+    assert loaded.sources["litellm"].models == 0
+    assert loaded.sources["litellm"].skipped == 0
 
 
 def test_load_corrupt_file_backs_up_and_returns_empty(tmp_path):

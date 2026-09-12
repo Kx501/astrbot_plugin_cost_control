@@ -1,5 +1,7 @@
 """汇率换算纯函数单测：内置货币换算与未知货币兜底。"""
 
+import pytest
+
 from cost_control.exchange_rates import DEFAULT_RATES, _lookup_rate, convert
 
 
@@ -58,6 +60,23 @@ def test_lookup_rate_invalid_or_nonpositive_returns_none():
     assert _lookup_rate("XYZ", {"XYZ": 0}) is None
     assert _lookup_rate("XYZ", {"XYZ": "bad"}) is None
     assert _lookup_rate("XYZ", {"XYZ": None}) is None
+
+
+@pytest.mark.parametrize("invalid", [float("nan"), float("inf"), float("-inf")])
+def test_nonfinite_values_cannot_propagate_into_currency_totals(invalid):
+    assert _lookup_rate("XYZ", {"XYZ": invalid}) is None
+    assert convert(10.0, "USD", "XYZ", {"XYZ": invalid}) == 10.0
+    assert convert(invalid, "USD", "CNY", None) == 0.0
+
+
+def test_config_rates_normalize_codes_and_preserve_valid_fallbacks():
+    from cost_control.exchange_rates import get_rates
+
+    rates = get_rates({"exchange_rates": {" cny ": "7", "EUR": float("inf"), "USD": 4, "JPY": 0}})
+    assert rates["CNY"] == 7.0
+    assert rates["USD"] == 1.0
+    assert rates["EUR"] == DEFAULT_RATES["EUR"]
+    assert rates["JPY"] == DEFAULT_RATES["JPY"]
 
 
 # ===== sync_rates：阻塞取数必须下沉线程，结果原样回传 =====

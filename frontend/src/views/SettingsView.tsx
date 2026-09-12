@@ -1,8 +1,8 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { api } from "../lib/api";
 import { useApi } from "../hooks/useApi";
 import { useAutoSave } from "../hooks/useAutoSave";
-import { fmtNum, CURRENCY_OPTIONS, currencyToSymbol } from "../lib/format";
+import { fmtNum, CURRENCY_OPTIONS, currencyToCode, currencyToSymbol } from "../lib/format";
 import { Panel } from "../components/Panel";
 import { Button } from "../components/Button";
 import { SaveToast } from "../components/SaveToast";
@@ -92,6 +92,7 @@ const SECTIONS: SettingSection[] = [
       },
       {
         k: "daily_report_time",
+        group: "alerts",
         label: "日报推送时间",
         type: "str",
         width: 100,
@@ -99,6 +100,7 @@ const SECTIONS: SettingSection[] = [
       },
       {
         k: "daily_report_to",
+        group: "alerts",
         label: "日报接收方",
         type: "csv",
         help: "接收日报的会话 UMO 列表，逗号分隔。在目标会话中向 Bot 发送 /sid 即可获取该会话的 UMO；/sid 是 AstrBot 的内置指令，需在 WebUI「插件管理」中启用「内置指令」插件后才可用。",
@@ -190,6 +192,7 @@ const SECTIONS: SettingSection[] = [
     fields: [
       {
         k: "platforms",
+        group: "_master",
         label: "生效平台",
         type: "csv",
         help: "限定插件只处理这些平台的请求（如 aiocqhttp、telegram_official、lark）；留空 = 对所有平台生效。",
@@ -229,9 +232,15 @@ export function SettingsView({
   >([]);
 
   useEffect(() => {
-    api.getAiProvider().then((info) => {
-      if (info.providers) setAiProviders(info.providers);
-    });
+    let cancelled = false;
+    void api.getAiProvider()
+      .then((info) => {
+        if (!cancelled && info?.providers) setAiProviders(info.providers);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const PURGE_OPTIONS = [
@@ -264,8 +273,31 @@ export function SettingsView({
     }
   }, [res.data]);
 
+  // Only send fields this page edits: a stale settings snapshot must not overwrite
+  // budgets, pricing selections or exchange rates changed by another request.
+  const settingsPayload = useMemo(() => {
+    const selected: Record<string, unknown> = {};
+    for (const section of SECTIONS) {
+      for (const field of section.fields) {
+        const group = field.group ?? section.key;
+        if (group === "_master") {
+          if (field.k in edit) selected[field.k] = edit[field.k];
+        } else if (edit[group] && typeof edit[group] === "object") {
+          const scope = edit[group] as Record<string, unknown>;
+          if (field.k in scope) {
+            selected[group] = {
+              ...((selected[group] as Record<string, unknown>) ?? {}),
+              [field.k]: scope[field.k],
+            };
+          }
+        }
+      }
+    }
+    return selected;
+  }, [edit]);
+
   const { status, error } = useAutoSave(
-    edit,
+    settingsPayload,
     async (p) => {
       await api.postSaveConfig(p);
       // 主货币变更：通知父组件刷新全局货币代码与其它页面数据
@@ -331,9 +363,12 @@ export function SettingsView({
       setSyncMsg(
         `已同步 ${r.count} 种货币汇率（${r.exchange_rates_updated_at || "?"}）`,
       );
-      // 刷新本地 config 副本（exchange_rates 已在后端持久化）
-      const cfg = await api.getConfig();
-      setEdit(JSON.parse(JSON.stringify(cfg)));
+      // Preserve unsaved settings while updating only the synchronized rate fields.
+      setEdit((prev) => ({
+        ...prev,
+        exchange_rates: r.exchange_rates,
+        exchange_rates_updated_at: r.exchange_rates_updated_at,
+      }));
     } catch (e) {
       setSyncMsg(`同步失败：${e instanceof Error ? e.message : String(e)}`);
     } finally {
@@ -448,7 +483,7 @@ export function SettingsView({
                     </div>
                     <select
                       className="budget-input set-field-control"
-                      value={String(v || "")}
+                      value={f.k === "currency_symbol" ? currencyToCode(String(v || "")) : String(v || "")}
                       onChange={(e) => setField(g, f.k, "select", e.target.value)}
                       style={{ width: f.width ?? 140 }}
                     >

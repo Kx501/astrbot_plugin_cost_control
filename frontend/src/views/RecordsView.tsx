@@ -1,5 +1,6 @@
 import { useMemo, useState } from "react";
 import { api } from "../lib/api";
+import { rangeParams } from "../lib/recordRange";
 import { useApi } from "../hooks/useApi";
 import { fmtCost, fmtNum, shortModelName, shortTime, shortUmo } from "../lib/format";
 import type {
@@ -26,23 +27,6 @@ const DEFAULT_FILTER: RecordsFilter = {
 
 const PAGE_SIZE = 50;
 
-function rangeParams(filter: RecordsFilter): { start: string; end: string } {
-  const now = new Date();
-  const end = now.toISOString().slice(0, 10);
-  if (filter.preset === "today") return { start: end, end };
-  if (filter.preset === "7d") {
-    const d = new Date(now);
-    d.setDate(d.getDate() - 6);
-    return { start: d.toISOString().slice(0, 10), end };
-  }
-  if (filter.preset === "30d") {
-    const d = new Date(now);
-    d.setDate(d.getDate() - 29);
-    return { start: d.toISOString().slice(0, 10), end };
-  }
-  return { start: filter.start || "", end: filter.end || "" };
-}
-
 export function RecordsView({ refreshNonce }: { refreshNonce: number }) {
   const [filter, setFilter] = useState<RecordsFilter>(DEFAULT_FILTER);
   const [aggMode, setAggMode] = useState<"model" | "umo">("model");
@@ -50,7 +34,7 @@ export function RecordsView({ refreshNonce }: { refreshNonce: number }) {
 
   const range = useMemo(
     () => rangeParams(filter),
-    [filter.preset, filter.start, filter.end],
+    [filter.preset, filter.start, filter.end, refreshNonce],
   );
 
   // 模型下拉选项：从 overview 的 cost_by_model 取（一次性，不随筛选变）

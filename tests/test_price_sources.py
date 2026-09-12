@@ -651,6 +651,29 @@ def test_sync_all_failure_preserves_old_prices(monkeypatch, tmp_path):
     assert cat.get_source("litellm").models == 1  # 保留旧计数
 
 
+def test_unexpected_source_exception_does_not_discard_other_results(monkeypatch, tmp_path):
+    original = ps.sync_source
+
+    def fail_one(source, *args, **kwargs):
+        if source == "openrouter":
+            raise ValueError("source adapter failed")
+        return original(source, *args, **kwargs)
+
+    monkeypatch.setattr(ps, "sync_source", fail_one)
+    monkeypatch.setattr(
+        ps,
+        "http_get",
+        _mock_http(
+            {ps.SOURCE_URLS["litellm"]: ({"m": {"input_cost_per_token": 1e-6}}, 200, {}, "")}
+        ),
+    )
+    result = asyncio.run(ps.sync_all({}, str(tmp_path), sources=["openrouter", "litellm"]))
+    assert result["ok"] is False
+    cat = load_catalog(str(tmp_path))
+    assert cat.prices["litellm:m"].prompt == 1.0
+    assert cat.get_source("openrouter").status == "error"
+
+
 # ---- tiered_expr 导入验证与 v1: 前缀（P1-2）----
 
 

@@ -52,9 +52,9 @@ def report_window_start(
     window = (window or "daily").strip().lower()
     daily_start = day_window_start(refresh_time, now_utc, tz)
     if window == "weekly":
-        return daily_start - timedelta(days=6)
+        return (daily_start.astimezone(tz) - timedelta(days=6)).astimezone(UTC)
     if window == "monthly":
-        return daily_start - timedelta(days=29)
+        return (daily_start.astimezone(tz) - timedelta(days=29)).astimezone(UTC)
     return daily_start
 
 
@@ -78,13 +78,13 @@ def compare_windows(
     cur_end = now_utc
     w = (window or "daily").strip().lower()
     if w == "monthly":
-        prev_start = cur_start - timedelta(days=30)
+        prev_start = (cur_start.astimezone(tz) - timedelta(days=30)).astimezone(UTC)
         prev_end = cur_start
     elif w == "weekly":
-        prev_start = cur_start - timedelta(days=7)
+        prev_start = (cur_start.astimezone(tz) - timedelta(days=7)).astimezone(UTC)
         prev_end = cur_start
     else:
-        prev_start = cur_start - timedelta(days=1)
+        prev_start = (cur_start.astimezone(tz) - timedelta(days=1)).astimezone(UTC)
         prev_end = cur_start
     return cur_start, cur_end, prev_start, prev_end
 
@@ -291,8 +291,8 @@ class AnalyticsMixin:
             "top_sessions_by_cost": [],
         }
         try:
-            usage = await self.query_usage(start=start)
-            rows = await self.query_usage_cost_rows(pricing, start=start)
+            usage = await self.query_usage(start=start, end=now)
+            rows = await self.query_usage_cost_rows(pricing, start=start, end=now)
             # 按 model 二次聚合（同模型可能由多个 provider 提供、不同价）
             model_agg: dict[str, dict[str, Any]] = {}
             for r in rows:
@@ -314,11 +314,7 @@ class AnalyticsMixin:
             cost_by_model.sort(key=lambda m: m["cost"], reverse=True)
             total_cost = round(sum(m["cost"] for m in cost_by_model), 6)
 
-            sups = await self.query_supplements(start=start, limit=5000)
-            if len(sups) >= 5000:
-                logger.warning(
-                    "[cost_control] 月报补充记录达到 limit=5000，缓存/注入统计可能被截断"
-                )
+            sups = await self.query_supplements(start=start, end=now, limit=None)
             agg = _aggregate_supplements(sups, pricing, main_cur, rates)
 
             return {

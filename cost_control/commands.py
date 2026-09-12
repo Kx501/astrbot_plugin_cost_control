@@ -22,9 +22,9 @@ from astrbot.api.event import AstrMessageEvent, filter
 
 from .attributor import ESTIMATION_NOTE
 from .budget import _DIM_ORDER, day_window_start, get_budget_overrides, resolve_tz
-from .config import get_config
+from .config import get_budgets_cost_currency, get_config
 from .cost import compute_row_cost_in_main
-from .exchange_rates import currency_to_symbol, get_main_currency, get_rates
+from .exchange_rates import convert, currency_to_symbol, get_main_currency, get_rates
 
 # 插件主模块路径（``main.py``）。AstrBot 的 ``star_map`` 以 ``Main.__module__``
 # 为键，而 ``update_command_permission`` 等管理接口通过 ``handler.__module__``
@@ -55,6 +55,7 @@ class CommandsMixin:
     # 兄弟 Mixin 提供。
     query_usage: Any
     query_usage_grouped: Any
+    query_usage_cost_rows: Any
     query_supplements: Any
     get_budgets: Any
     get_budgets_cost: Any
@@ -87,9 +88,25 @@ class CommandsMixin:
             main_cur = get_main_currency(getattr(self, "cfg", None))
             rates = get_rates(getattr(self, "cfg", None))
             sym = currency_to_symbol(main_cur)
-            cost = round(
-                sum(compute_row_cost_in_main(r, pricing, main_cur, rates) for r in rows), 6
-            )
+            by_model: dict[str, dict[str, Any]] = {}
+            cost = 0.0
+            errors = 0
+            for row in rows:
+                if not isinstance(row, dict):
+                    errors += 1
+                    continue
+                name = str(row.get("provider_model") or row.get("key") or "?")
+                item = by_model.setdefault(name, {"count": 0, "cost": 0.0, "errors": 0})
+                try:
+                    item["count"] += int(row.get("count", 0) or 0)
+                    row_cost = compute_row_cost_in_main(row, pricing, main_cur, rates)
+                except Exception:
+                    item["errors"] += 1
+                    errors += 1
+                    continue
+                item["cost"] += row_cost
+                cost += row_cost
+            cost = round(cost, 6)
             lines = [
                 "💰 今日用量（本会话）",
                 f"调用 {usage.get('count', 0)} 次，成本 ≈ {sym}{cost:.4f}",
@@ -97,10 +114,12 @@ class CommandsMixin:
                 f"缓存命中 {usage.get('token_input_cached', 0)} / "
                 f"输出 {usage.get('token_output', 0)}",
             ]
-            for r in rows[:5]:
-                c = round(compute_row_cost_in_main(r, pricing, main_cur, rates), 6)
-                name = r.get("provider_model") or r.get("key") or "?"
-                lines.append(f"  · {name}：{r.get('count', 0)}次 / {sym}{c:.4f}")
+            if errors:
+                lines.append(f"⚠️ {errors} 个计费分组计算失败，金额仅含可计算部分")
+            top_models = sorted(by_model.items(), key=lambda pair: pair[1]["cost"], reverse=True)
+            for name, item in top_models[:5]:
+                suffix = "（部分费用未知）" if item["errors"] else ""
+                lines.append(f"  · {name}：{item['count']}次 / {sym}{item['cost']:.4f}{suffix}")
             yield event.plain_result("\n".join(lines))
         except Exception as e:
             yield event.plain_result(f"查询失败：{e}")
@@ -110,7 +129,11 @@ class CommandsMixin:
         """``/budget``：查询预算配置与当前超限状态。"""
         try:
             umo = self._umo(event)
-            sym = currency_to_symbol(get_main_currency(getattr(self, "cfg", None)))
+            cfg = getattr(self, "cfg", None)
+            main_cur = get_main_currency(cfg)
+            sym = currency_to_symbol(main_cur)
+            rates = get_rates(cfg)
+            limit_currencies = get_budgets_cost_currency(cfg)
             budgets = self.get_budgets()
             budgets_cost = self.get_budgets_cost()
             overrides = get_budget_overrides(getattr(self, "cfg", None))
@@ -120,6 +143,7 @@ class CommandsMixin:
             for dim in _DIM_ORDER:
                 t = int(budgets.get(dim, 0) or 0)
                 c = float(budgets_cost.get(dim, 0) or 0)
+                c = convert(c, limit_currencies.get(dim) or main_cur, main_cur, rates)
                 if t > 0 or c > 0:
                     parts = []
                     if t > 0:
@@ -137,7 +161,10 @@ class CommandsMixin:
                     if ov.get("token_limit", 0) > 0:
                         parts.append(f"token {ov['token_limit']}")
                     if ov.get("cost_limit", 0) > 0:
-                        parts.append(f"花费 {sym}{ov['cost_limit']:.2f}")
+                        cost_limit = convert(
+                            ov["cost_limit"], ov.get("cost_currency") or main_cur, main_cur, rates
+                        )
+                        parts.append(f"花费 {sym}{cost_limit:.2f}")
                     lines.append(
                         f"  · {ov.get('target_type')}:{ov.get('target_value')} "
                         f"({'/'.join(parts) or '不限'}) "

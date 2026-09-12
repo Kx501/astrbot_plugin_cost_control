@@ -1059,14 +1059,24 @@ async def _sync_all_locked(
     async def _one(source: str) -> SourceResult:
         async with sem:
             prev = catalog.get_source(source)
-            return await asyncio.to_thread(
-                sync_source,
-                source,
-                prev,
-                cfg=cfg,
-                timeout=timeout,
-                provider_cfg=provider_cfg,
-            )
+            try:
+                return await asyncio.to_thread(
+                    sync_source,
+                    source,
+                    prev,
+                    cfg=cfg,
+                    timeout=timeout,
+                    provider_cfg=provider_cfg,
+                )
+            except Exception as exc:
+                # provider 配置回调、URL 构造或解析器也可能抛异常；单源失败
+                # 不能让 gather 提前退出，丢掉已经同步成功的其它源。
+                _logger.debug(
+                    "[cost_control] 价格源同步异常 source=%s class=%s",
+                    source,
+                    type(exc).__name__,
+                )
+                return SourceResult(source=source, status="error", error=type(exc).__name__)
 
     results = await asyncio.gather(*(_one(s) for s in targets))
 

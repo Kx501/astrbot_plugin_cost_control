@@ -33,6 +33,9 @@ class AiDiagMixin:
     query_cache_events: Any
     query_usage: Any
     query_usage_grouped: Any
+    query_usage_cost_rows: Any
+    query_user_token_totals: Any
+    query_user_cost_total: Any
     get_data_dir: Any
 
     # ===== 缓存读写 =====
@@ -93,8 +96,15 @@ class AiDiagMixin:
         cached = self._load_diag_cache()
         if not cached:
             return {"result": None}
-        ts = int(cached.get("timestamp", 0) or 0)
         now = int(time.time())
+        try:
+            ts = int(cached.get("timestamp", 0) or 0)
+        except (TypeError, ValueError, OverflowError):
+            return {"result": None}
+        if ts <= 0 or ts > now:
+            return {"result": None}
+        if self._parse_conclusion(json.dumps(cached.get("conclusion"))) is None:
+            return {"result": None}
         age = max(0, now - ts)
         return {
             "result": cached,
@@ -141,7 +151,11 @@ class AiDiagMixin:
             for p in self.context.provider_manager.provider_insts:
                 meta = p.meta()
                 if meta.id == provider_id:
-                    model = getattr(meta, "model_name", None) or provider_id
+                    model = (
+                        getattr(meta, "model", None)
+                        or getattr(meta, "model_name", None)
+                        or provider_id
+                    )
                     return f"{model} ({provider_id})"
         except Exception:
             pass
@@ -254,7 +268,14 @@ class AiDiagMixin:
                 resolve_tz,
                 total_tokens,
             )
-            from .config import get_config, get_currency_symbol, get_rates
+            from .config import (
+                get_budgets_cost_currency,
+                get_config,
+                get_currency_symbol,
+                get_rates,
+            )
+            from .cost import compute_cost_grouped_in_main
+            from .exchange_rates import convert
 
             now = datetime.now(UTC)
             tz = resolve_tz(self.context)
@@ -271,45 +292,73 @@ class AiDiagMixin:
             # 的 token 用量取当日最大会话/用户/模型，代表最接近限额的主体）。
             main_cur = get_currency_symbol(getattr(self, "cfg", None))
             rates = get_rates(getattr(self, "cfg", None))
-            day_cost = month_cost = 0.0
-            try:
-                from .cost import compute_cost_grouped_in_main
+            pricing = self.get_pricing()
+            limit_currencies = get_budgets_cost_currency(getattr(self, "cfg", None))
 
-                pricing = self.get_pricing()
-                day_cost = compute_cost_grouped_in_main(
-                    await self.query_usage_cost_rows(pricing, start=d_start),
-                    pricing,
-                    main_cur,
-                    rates,
-                )
-                month_cost = compute_cost_grouped_in_main(
-                    await self.query_usage_cost_rows(pricing, start=m_start),
-                    pricing,
-                    main_cur,
-                    rates,
-                )
-            except Exception:
-                pass
-
-            async def _max_group_total(by: str) -> int:
-                best = 0
-                for g in await self.query_usage_grouped(by=by, start=d_start):
-                    best = max(
-                        best,
-                        int(g.get("token_input_other", 0) or 0)
-                        + int(g.get("token_input_cached", 0) or 0)
-                        + int(g.get("token_output", 0) or 0),
+            async def _cost_total(start, **filters) -> float | None:
+                try:
+                    return compute_cost_grouped_in_main(
+                        await self.query_usage_cost_rows(pricing, start=start, **filters),
+                        pricing,
+                        main_cur,
+                        rates,
                     )
-                return best
+                except Exception:
+                    return None  # 无法计算时保留未知，不能向诊断模型提供假零成本。
 
-            top_session = await _max_group_total("umo")
-            top_model = await _max_group_total("model")
-            top_user = 0
+            day_cost = await _cost_total(d_start)
+            month_cost = await _cost_total(m_start)
+            sessions = await self.query_usage_grouped(by="umo", start=d_start)
+            models = await self.query_usage_grouped(by="model", start=d_start)
+            top_session = max((total_tokens(g) for g in sessions), default=0)
+            top_model = max((total_tokens(g) for g in models), default=0)
+            user_totals = []
+            users_available = True
             try:
-                user_totals = await self.query_user_token_totals(d_start)
-                top_user = user_totals[0][1] if user_totals else 0
+                user_totals = await self.query_user_token_totals(d_start, limit=500)
             except Exception:
-                pass
+                users_available = False
+            top_user = max((int(tokens) for _, tokens in user_totals), default=0)
+
+            async def _maximum_cost(subjects, query) -> float | None:
+                import asyncio
+
+                sem = asyncio.Semaphore(8)
+
+                async def one(subject):
+                    async with sem:
+                        try:
+                            return await query(subject)
+                        except Exception:
+                            return None
+
+                amounts = await asyncio.gather(*(one(subject) for subject in subjects))
+                if any(amount is None for amount in amounts):
+                    return None
+                return max(amounts, default=0.0)
+
+            dim_cost = {"global_daily": day_cost, "global_monthly": month_cost}
+            if float(limits_cost.get("per_session_daily", 0) or 0) > 0:
+                dim_cost["per_session_daily"] = await _maximum_cost(
+                    {str(g["key"]) for g in sessions if g.get("key")},
+                    lambda key: _cost_total(d_start, umo=key),
+                )
+            if float(limits_cost.get("per_model_daily", 0) or 0) > 0:
+                dim_cost["per_model_daily"] = await _maximum_cost(
+                    {str(g["key"]) for g in models if g.get("key")},
+                    lambda key: _cost_total(d_start, model=key),
+                )
+            if float(limits_cost.get("per_user_daily", 0) or 0) > 0:
+                dim_cost["per_user_daily"] = (
+                    await _maximum_cost(
+                        {str(uid) for uid, _ in user_totals},
+                        lambda uid: self.query_user_cost_total(
+                            uid, d_start, pricing, main_cur, rates
+                        ),
+                    )
+                    if users_available
+                    else None
+                )
 
             dims: list[dict[str, Any]] = []
             dim_labels = {
@@ -326,17 +375,26 @@ class AiDiagMixin:
                 "per_user_daily": top_user,
                 "per_model_daily": top_model,
             }
-            dim_cost = {"global_daily": day_cost, "global_monthly": month_cost}
             for d in _DIM_ORDER:
                 lt = int(limits.get(d, 0) or 0)
-                lc = float(limits_cost.get(d, 0) or 0)
+                lc = convert(
+                    float(limits_cost.get(d, 0) or 0),
+                    limit_currencies.get(d) or main_cur,
+                    main_cur,
+                    rates,
+                )
                 used = dim_used.get(d, 0)
-                cost_used = round(float(dim_cost.get(d, 0.0) or 0.0), 6)
+                raw_cost = dim_cost.get(d)
+                cost_used = round(raw_cost, 6) if raw_cost is not None else None
                 if lt > 0 or lc > 0:
                     ratio = round(used * 100.0 / lt, 1) if lt > 0 else 0
-                    cost_ratio = round(cost_used * 100.0 / lc, 1) if lc > 0 else 0
+                    cost_ratio = (
+                        round(cost_used * 100.0 / lc, 1)
+                        if lc > 0 and cost_used is not None
+                        else None
+                    )
                     exceeded_t = used >= lt if lt > 0 else False
-                    exceeded_c = cost_used >= lc if lc > 0 else False
+                    exceeded_c = cost_used >= lc if lc > 0 and cost_used is not None else False
                     entry: dict[str, Any] = {
                         "dimension": dim_labels.get(d, d),
                         "token_limit": lt,
@@ -349,8 +407,14 @@ class AiDiagMixin:
                         entry["cost_used"] = cost_used
                         entry["cost_ratio"] = cost_ratio
                         entry["currency"] = main_cur
+                        if cost_used is None:
+                            entry["cost_error"] = "成本计算失败，花费超限状态未知"
+                            if not exceeded_t:
+                                entry["exceeded"] = None
                     if d.startswith("per_"):
-                        entry["note"] = "局部维度用量为当日最大主体的用量"
+                        entry["note"] = "token 与花费分别取当日最大主体，可能来自不同主体"
+                    if d == "per_user_daily":
+                        entry["note"] += "；用户范围为当日 token 最多的至多 500 名用户"
                     dims.append(entry)
             data["budgets"] = {"dimensions": dims, "currency": main_cur}
         except Exception as e:
@@ -472,7 +536,7 @@ class AiDiagMixin:
         # 4. 预算状态
         bd = data.get("budgets", {})
         if "error" not in bd:
-            bd_dims = json.dumps(bd.get("dimensions", []), ensure_ascii=False)[:600]
+            bd_dims = json.dumps(bd.get("dimensions", []), ensure_ascii=False)
             sections.append(f"## 预算状态\n已配置的预算维度：{bd_dims}")
         else:
             sections.append(f"## 预算状态\n状态：数据获取失败（{bd.get('error')}）")
@@ -504,23 +568,58 @@ class AiDiagMixin:
         兼容三种情况：纯 JSON、```json ...``` 代码块、混杂文本中提取。
         """
         text = text.strip()
+
+        def parse_object(value: str) -> dict | None:
+            decoded = json.loads(value)
+            if not isinstance(decoded, dict):
+                return None
+            for field in ("overall", "summary"):
+                if field in decoded and not isinstance(decoded[field], str):
+                    return None
+            if "highlights" in decoded:
+                highlights = decoded["highlights"]
+                if not isinstance(highlights, list) or not all(
+                    isinstance(item, str) for item in highlights
+                ):
+                    return None
+            if "risks" in decoded:
+                risks = decoded["risks"]
+                if not isinstance(risks, list) or not all(
+                    isinstance(item, dict)
+                    and all(
+                        isinstance(item.get(key, ""), str)
+                        for key in ("module", "level", "issue", "advice")
+                    )
+                    for item in risks
+                ):
+                    return None
+            if "overall_score" in decoded:
+                score = decoded["overall_score"]
+                if (
+                    isinstance(score, bool)
+                    or not isinstance(score, (int, float))
+                    or not 0 <= score <= 100
+                ):
+                    return None
+            return decoded
+
         # 直接解析整段 JSON
         try:
-            return json.loads(text)
+            return parse_object(text)
         except Exception:
             pass
         # 降级 1：提取 ```json ...``` 代码块
         m = re.search(r"```(?:json)?\s*([\s\S]*?)```", text)
         if m:
             try:
-                return json.loads(m.group(1).strip())
+                return parse_object(m.group(1).strip())
             except Exception:
                 pass
         # 降级 2：提取首个 {...} 花括号块
         m = re.search(r"\{[\s\S]*\}", text)
         if m:
             try:
-                return json.loads(m.group(0))
+                return parse_object(m.group(0))
             except Exception:
                 pass
         return None
@@ -590,6 +689,7 @@ class AiDiagMixin:
                 # 5. 成功则缓存到文件
                 self._save_diag_cache(result)
             else:
+                result["error"] = "LLM 返回内容不是有效的诊断 JSON 对象"
                 logger.warning("[cost_control] AI诊断：LLM 返回内容无法解析为 JSON")
         except Exception as e:
             err_msg = f"{type(e).__name__}: {e}"

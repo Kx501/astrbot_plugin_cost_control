@@ -14,7 +14,7 @@ import type {
   UserPricingEntry,
 } from "../lib/types";
 import type { CandidateBrief, PriceSelection } from "../lib/types";
-import { CURRENCY_OPTIONS, currencyToSymbol } from "../lib/format";
+import { CURRENCY_OPTIONS, currencyToCode, currencyToSymbol } from "../lib/format";
 import {
   PerTierEditor,
   emptyServiceTierDraft,
@@ -69,7 +69,7 @@ const fmtStr = (v: number | null | undefined): string => (v == null ? "" : Strin
 // 新建草稿的默认计价货币：跟随主货币；USD 归一为 ""（内部基准，不落库 currency 字段），
 // 不在受支持列表的代码回退 ""，避免下拉框出现无法命中的值。
 export function normalizeDefaultCurrency(code?: string | null): string {
-  const c = String(code || "").trim().toUpperCase();
+  const c = currencyToCode(code);
   return c && c !== "USD" && CURRENCY_OPTIONS.includes(c) ? c : "";
 }
 
@@ -144,8 +144,8 @@ export function isDraftEmpty(d: DraftEntry): boolean {
 }
 
 function parseNum(raw: string): number {
-  const n = parseFloat(raw.trim());
-  if (Number.isNaN(n) || n < 0) throw new Error("非法数值");
+  const n = Number(raw.trim());
+  if (!Number.isFinite(n) || n < 0) throw new Error("非法数值");
   return n;
 }
 
@@ -199,7 +199,7 @@ export function draftToEntry(d: DraftEntry): UserPricingEntry | null {
         const mult = (raw: string): number | undefined => {
           if (!raw.trim()) return undefined;
           const n = parseNum(raw);
-          return n > 0 ? n : undefined;
+          return n;
         };
         const im = mult(s.input_multiplier);
         if (im !== undefined) st.input_multiplier = im;

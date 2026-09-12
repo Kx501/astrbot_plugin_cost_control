@@ -112,8 +112,8 @@ class SourceStatus:
             enabled=bool(data.get("enabled", True)),
             status=str(data.get("status") or "pending"),
             updated_at=str(data.get("updated_at") or ""),
-            models=int(data.get("models", 0) or 0),
-            skipped=int(data.get("skipped", 0) or 0),
+            models=_nonnegative_int(data.get("models")),
+            skipped=_nonnegative_int(data.get("skipped")),
             error=str(data.get("error") or ""),
             etag=str(data.get("etag") or ""),
             provider_id=(str(data["provider_id"]) if data.get("provider_id") else None),
@@ -159,7 +159,7 @@ class PriceCatalog:
     def from_dict(cls, data: Any) -> PriceCatalog:
         if not isinstance(data, dict):
             return cls()
-        cat = cls(version=int(data.get("version", CATALOG_VERSION) or CATALOG_VERSION))
+        cat = cls(version=_nonnegative_int(data.get("version")) or CATALOG_VERSION)
         cat.updated_at = str(data.get("updated_at") or "")
         sources = data.get("sources") or {}
         if isinstance(sources, dict):
@@ -211,14 +211,14 @@ class PriceCatalog:
 
     def replace_source_prices(self, source: str, prices: dict[str, CatalogPrice]) -> None:
         """用一次同步结果整体替换某源的价格条目（其它源条目保持不变）。"""
-        self.prices = {key: p for key, p in self.prices.items() if not _is_same_source(key, source)}
+        self.prices = {key: p for key, p in self.prices.items() if p.source != source}
         for key, price in prices.items():
             self.prices[key] = price
         self.updated_at = _now_iso()
         self._candidate_cache.clear()
 
     def prices_for_source(self, source: str) -> dict[str, CatalogPrice]:
-        return {key: p for key, p in self.prices.items() if _is_same_source(key, source)}
+        return {key: p for key, p in self.prices.items() if p.source == source}
 
     # ---- 候选匹配 ----
     def find_candidates(
@@ -315,12 +315,6 @@ def _catalog_path(data_dir: str) -> str:
     return os.path.join(data_dir, CATALOG_FILENAME)
 
 
-def _is_same_source(price_key: str, source: str) -> bool:
-    # price_key = "<source>:<source_model_id>"；source 自身可能含 ':'（newapi:<pid>），
-    # 故用 startswith(source + ":") 而非 split。
-    return price_key.startswith(source + ":")
-
-
 def _score_match(
     source: str,
     source_model_id: str,
@@ -374,6 +368,14 @@ def _opt_float(v: Any) -> float | None:
         return f if f >= 0 and math.isfinite(f) else None
     except (TypeError, ValueError):
         return None
+
+
+def _nonnegative_int(value: Any) -> int:
+    """损坏的状态计数不能导致整个价格目录被当作损坏而丢弃。"""
+    try:
+        return max(0, int(value or 0))
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def _str_bool_dict(v: Any) -> dict[str, bool]:

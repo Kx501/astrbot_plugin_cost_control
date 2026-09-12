@@ -142,6 +142,78 @@ def _deleted_provider_residues(
     return out
 
 
+def _normalize_api_pricing_entry(entry: Any) -> dict[str, Any]:
+    """Reject invalid writes before the tolerant config loader can turn them into zero."""
+    import math
+
+    from .config import _normalize_user_entry
+
+    fields = ("input", "input_cached", "output", "cache_creation")
+
+    def is_set(value: Any) -> bool:
+        return value is not None and not (isinstance(value, str) and not value.strip())
+
+    def number(value: Any, label: str) -> float:
+        try:
+            if isinstance(value, bool):
+                raise ValueError
+            result = float(value)
+        except (TypeError, ValueError, OverflowError) as e:
+            raise ValueError(f"{label} 必须是非负有限数") from e
+        if not math.isfinite(result) or result < 0:
+            raise ValueError(f"{label} 必须是非负有限数")
+        return result
+
+    def price_fields(raw: Any, label: str, *, suffix: str = "") -> bool:
+        if not isinstance(raw, dict):
+            raise ValueError(f"{label} 必须是对象")
+        configured = False
+        for field in fields:
+            key = field + suffix
+            if is_set(raw.get(key)):
+                number(raw[key], f"{label}.{key}")
+                configured = True
+        return configured
+
+    if not isinstance(entry, dict):
+        raise ValueError("定价条目必须是对象")
+    mode = str(entry.get("mode") or "per_token").strip().lower()
+    if mode == "per_token":
+        price_fields(entry, "pricing")
+    elif mode in ("per_turn", "per_request"):
+        number(entry.get("price"), "pricing.price")
+    elif mode == "per_tier":
+        if not price_fields(entry.get("base"), "pricing.base"):
+            raise ValueError("pricing.base 至少填写一项单价")
+        for key in ("context_tiers", "service_tiers"):
+            tiers = entry.get(key, [])
+            if not isinstance(tiers, list):
+                raise ValueError(f"pricing.{key} 必须是数组")
+            for index, tier in enumerate(tiers):
+                label = f"pricing.{key}[{index}]"
+                if not isinstance(tier, dict):
+                    raise ValueError(f"{label} 必须是对象")
+                if key == "context_tiers":
+                    threshold = tier.get("threshold_tokens")
+                    number(threshold, f"{label}.threshold_tokens")
+                    try:
+                        if int(threshold) != float(threshold):
+                            raise ValueError
+                    except (TypeError, ValueError, OverflowError) as e:
+                        raise ValueError(f"{label}.threshold_tokens 必须是非负整数") from e
+                    if not price_fields(tier, label):
+                        raise ValueError(f"{label} 至少填写一项单价")
+                else:
+                    if not isinstance(tier.get("match"), str) or not tier["match"].strip():
+                        raise ValueError(f"{label}.match 不能为空")
+                    if not price_fields(tier, label, suffix="_multiplier"):
+                        raise ValueError(f"{label} 至少填写一项倍率")
+    normalized = _normalize_user_entry(entry)
+    if normalized is None:
+        raise ValueError("定价模式、阶梯结构或计费表达式无效")
+    return normalized
+
+
 class WebApiMixin:
     """注册 REST Web API 路由的 Mixin。"""
 
@@ -333,7 +405,7 @@ class WebApiMixin:
         带偏移的 ISO。无时区信息者按 UTC 处理。
 
         Args:
-            is_end: True 时纯日期输入顺延至次日 00:00（用于 end 区间右端包容当天）。
+            is_end: True 时纯日期输入取当天最后一微秒（查询 end 使用 <=）。
         """
         if not s:
             return None
@@ -350,9 +422,9 @@ class WebApiMixin:
                 dt = dt.replace(tzinfo=UTC)
             else:
                 dt = dt.astimezone(UTC)
-            # 仅 end 参数：纯日期顺延至次日（包容当天全部时刻）
+            # 仅 end 参数：包容当天，排除次日午夜。
             if is_end and is_date_only:
-                dt = dt + timedelta(days=1)
+                dt = dt + timedelta(days=1) - timedelta(microseconds=1)
             return dt
         except Exception:
             return None
@@ -726,7 +798,7 @@ class WebApiMixin:
         为 ``null``（前端显示「新增」）。
         """
         try:
-            from datetime import UTC, datetime
+            from datetime import UTC, datetime, timedelta
 
             from .analytics import compare_windows
             from .budget import total_tokens
@@ -754,7 +826,7 @@ class WebApiMixin:
                 }
 
             cur = await _stats(cur_start, cur_end)
-            prev = await _stats(prev_start, prev_end)
+            prev = await _stats(prev_start, prev_end - timedelta(microseconds=1))
 
             def _pct(c: float, p: float) -> float | None:
                 return round((c - p) * 100.0 / p, 1) if p > 0 else None
@@ -909,8 +981,8 @@ class WebApiMixin:
             from .cost import compute_row_cost_in_main
 
             # model / provider 维度：用 (provider_id, provider_model) 底层行精确算成本
-            # （按 provider_id 匹配用户定价），再二次聚合到请求维度。umo 维度底层无
-            # provider/model，成本无法精确（维持 0，已知局限）。
+            # （按 provider_id 匹配用户定价），再二次聚合到请求维度。会话维度另外
+            # 查询每个会话的 Provider/模型明细，避免把已定价的消耗显示为免费。
             groups: dict[str, dict[str, Any]] = {}
             if by == "umo":
                 rows = await self.query_usage_grouped(
@@ -943,6 +1015,19 @@ class WebApiMixin:
                     g["token_input_other"] += tio
                     g["token_input_cached"] += tic
                     g["token_output"] += tio_out
+                    if key:
+                        cost_rows = await self.query_usage_cost_rows(
+                            pricing,
+                            umo=key,
+                            provider=provider,
+                            model=model,
+                            start=start,
+                            end=end,
+                        )
+                        g["cost"] += sum(
+                            compute_row_cost_in_main(row, pricing, main_cur, rates)
+                            for row in cost_rows
+                        )
             else:
                 pm_rows = await self.query_usage_cost_rows(
                     pricing,
@@ -1695,6 +1780,10 @@ class WebApiMixin:
                         },
                     )
                     status["enabled"] = bool(config.get("enabled"))
+                    if config.get("provider_id"):
+                        status["provider_id"] = str(config["provider_id"])
+                    if config.get("base_url"):
+                        status["base_url"] = str(config["base_url"])
                 selections = get_price_selections(_pcfg)
                 # 附生效价格摘要，前端已选价直接回显，无需另查 catalog
                 for _per_model in selections.values():
@@ -1887,7 +1976,9 @@ class WebApiMixin:
                 body = await request.json
             except Exception:
                 body = None
-            pid = str((body or {}).get("provider_id") or "").strip()
+            if not isinstance(body, dict):
+                return self._err("请求体必须是 JSON 对象")
+            pid = str(body.get("provider_id") or "").strip()
             if not pid:
                 return self._err("缺少 provider_id")
             provider = self._provider_cfg_fn()(pid)
@@ -2037,7 +2128,9 @@ class WebApiMixin:
                 body = await request.json
             except Exception:
                 body = None
-            expr = str((body or {}).get("expr") or "").strip()
+            if not isinstance(body, dict):
+                return self._err("请求体必须是 JSON 对象")
+            expr = str(body.get("expr") or "").strip()
             if not expr:
                 return self._err("缺少 expr")
             try:
@@ -2094,7 +2187,7 @@ class WebApiMixin:
             return self._err(str(e))
 
     # purge 最小调用间隔（秒），防误触重复调用。
-    _purge_last_ts: float = 0.0
+    _purge_last_ts: float | None = None
 
     async def api_action_delete_provider_data(self, **kwargs: Any) -> dict[str, Any]:
         """删除一个已下线 Provider 的用量、补充记录及自定义定价（不可恢复）。
@@ -2203,9 +2296,6 @@ class WebApiMixin:
         """
         import time
 
-        now_ts = time.time()
-        if now_ts - self._purge_last_ts < 10:
-            return self._err("操作过于频繁，请 10 秒后重试")
         try:
             from quart import request
 
@@ -2217,18 +2307,28 @@ class WebApiMixin:
         if body.get("confirm") != "PURGE":
             return self._err('请在请求体中传入 "confirm": "PURGE" 确认清空操作')
         modules = body.get("modules", [])
-        if not isinstance(modules, list):
-            return self._err("modules 必须是数组")
         valid = {"supplements", "cache_events", "usage_stats", "ai_diag"}
+        if not isinstance(modules, list) or not modules:
+            return self._err("modules 必须是非空数组")
+        if any(not isinstance(m, str) or m not in valid for m in modules):
+            return self._err("modules 包含不支持的清空模块")
+        now_ts = time.monotonic()
+        last_ts = getattr(self, "_purge_last_ts", None)
+        if getattr(self, "_purge_in_progress", False) or (
+            last_ts is not None and now_ts - last_ts < 10
+        ):
+            return self._err("操作过于频繁，请 10 秒后重试")
+        self._purge_last_ts = now_ts
+        self._purge_in_progress = True
         results: dict[str, int] = {}
         try:
-            for m in modules:
-                if m in valid:
-                    results[m] = await self.purge_module(m)
-            self._purge_last_ts = now_ts
+            for m in dict.fromkeys(modules):
+                results[m] = await self.purge_module(m)
             return self._ok({"results": results})
         except Exception as e:
             return self._err(str(e))
+        finally:
+            self._purge_in_progress = False
 
     def _validate_save_payload(self, body: Any) -> tuple[dict[str, Any] | None, str]:
         """校验 save_config 请求体，返回合并后的**全量**配置或错误信息。
@@ -2236,8 +2336,9 @@ class WebApiMixin:
         以当前 ``self.cfg`` 为底座，按 body 提供的 key 逐项强转校验
         (:func:`coerce_to_default_type`)；``budget_overrides`` 逐条过
         :func:`normalize_budget_override`（非法整条丢弃）；``fallback_providers``
-        逐条过 :func:`normalize_fallback_provider`；``pricing`` 接受任意 dict；
-        ``pricing_multipliers`` 接受 AstrBot ``provider_source_id`` 到 0–100 倍率的映射（0 = 该分组计零成本）；
+        逐条过 :func:`normalize_fallback_provider`；``pricing`` 拒绝非法模式、结构与数值；
+        ``pricing_multipliers`` 接受 AstrBot ``provider_source_id`` 到 0–100 倍率的映射
+        （0 = 该分组计零成本）；
         ``default_on_exceeded`` 限定 ``stop|fallback|warn``。未知 key 忽略。
         """
         if not isinstance(body, dict):
@@ -2271,25 +2372,24 @@ class WebApiMixin:
             elif k == "pricing":
                 if not isinstance(v, dict):
                     return None, "pricing 必须是对象（key=provider_id）"
-                # 复用 config._normalize_user_entry 按 mode 规范化（key=provider_id）
-                from .config import _normalize_user_entry
-
                 normalized_p: dict[str, dict[str, Any]] = {}
                 for pid, entry in v.items():
                     pid_s = str(pid).strip()
                     if not pid_s:
-                        continue
-                    n = _normalize_user_entry(entry)
-                    if n is not None:
-                        normalized_p[pid_s] = n
+                        return None, "pricing 的 provider_id 不能为空"
+                    try:
+                        normalized_p[pid_s] = _normalize_api_pricing_entry(entry)
+                    except ValueError as e:
+                        return None, f"pricing[{pid_s}]：{e}"
                 out[k] = normalized_p
             elif k == "pricing_schedules":
-                from .config import normalize_pricing_schedules
-                from .pricing_schedule import PricingScheduleValidationError
+                from .pricing_schedule import normalize_pricing_schedules
 
                 try:
-                    out[k] = normalize_pricing_schedules(v, strict=True)
-                except PricingScheduleValidationError as e:
+                    out[k] = normalize_pricing_schedules(
+                        v, _normalize_api_pricing_entry, strict=True
+                    )
+                except ValueError as e:
                     return None, str(e)
             elif k == "price_sources":
                 # 不能用 coerce_to_default_type（非空默认 dict 会丢弃 newapi:<pid> 动态键）
@@ -2301,6 +2401,20 @@ class WebApiMixin:
             elif k == "pricing_multipliers":
                 if not isinstance(v, dict):
                     return None, "pricing_multipliers 必须是对象（key=provider_source_id）"
+                import math
+
+                for cluster_id, value in v.items():
+                    try:
+                        factor = float(value)
+                    except (TypeError, ValueError, OverflowError):
+                        return None, f"pricing_multipliers[{cluster_id}] 必须在 0–100 之间"
+                    if (
+                        not str(cluster_id).strip()
+                        or isinstance(value, bool)
+                        or not math.isfinite(factor)
+                        or not 0 <= factor <= 100
+                    ):
+                        return None, f"pricing_multipliers[{cluster_id}] 必须在 0–100 之间"
                 out[k] = normalize_pricing_multipliers(v)
             elif k == "exchange_rates":
                 # 接受任意 {货币代码: 汇率} dict，逐值转 float（可能含 API 同步的
@@ -2332,7 +2446,16 @@ class WebApiMixin:
                         bcc_out[str(bk)] = bs
                 out[k] = bcc_out
             elif k in CONFIG_DEFAULTS:
-                out[k] = coerce_to_default_type(v, CONFIG_DEFAULTS[k])
+                default = CONFIG_DEFAULTS[k]
+                if isinstance(default, dict) and default:
+                    if not isinstance(v, dict):
+                        return None, f"{k} 必须是对象"
+                    # Fixed-schema groups are patches. Preserve existing siblings,
+                    # otherwise changing a switch can reset recipients or retention.
+                    previous = out.get(k)
+                    previous = previous if isinstance(previous, dict) else {}
+                    v = deep_merge(default, previous, v)
+                out[k] = coerce_to_default_type(v, default)
             # else: 未知 key 忽略
         if not any(k in body for k in CONFIG_DEFAULTS):
             return None, "未提供可识别的配置项"
@@ -2406,14 +2529,22 @@ class WebApiMixin:
         ``exchange_rates_updated_at``，并持久化到插件 config.json；失败返回错误。
         """
         try:
-            from astrbot import logger
-
             from .exchange_rates import sync_rates
 
             rates, updated_at, err = await sync_rates()
             if err:
                 return self._err(f"汇率同步失败：{err}")
-            # 写入 self.cfg 并持久化
+            # Persist first: a failed disk write must not be reported as a saved sync.
+            from .config import load_plugin_config
+
+            data_dir = getattr(self, "_data_dir", None) or str(self.get_data_dir())
+            persisted = load_plugin_config(data_dir)
+            persisted["exchange_rates"] = rates
+            persisted["exchange_rates_updated_at"] = updated_at
+            try:
+                save_plugin_config(data_dir, persisted)
+            except Exception as e:
+                return self._err(f"汇率持久化失败：{e}")
             cfg = getattr(self, "cfg", None)
             if not isinstance(cfg, dict):
                 cfg = {}
@@ -2422,18 +2553,6 @@ class WebApiMixin:
             cfg["exchange_rates_updated_at"] = updated_at
             self.cfg = deep_merge(CONFIG_DEFAULTS, cfg)
             self._invalidate_runtime_pricing("exchange_rates_synced")
-            # 持久化到 config.json：只合并这两个 key 到已存文件，不写完整
-            # deep_merge 快照（避免把当前版本的全部默认值固化，遮蔽未来更新）。
-            data_dir = getattr(self, "_data_dir", None) or str(self.get_data_dir())
-            try:
-                from .config import load_plugin_config
-
-                persisted = load_plugin_config(data_dir)
-                persisted["exchange_rates"] = rates
-                persisted["exchange_rates_updated_at"] = updated_at
-                save_plugin_config(data_dir, persisted)
-            except Exception as e:
-                logger.warning("[cost_control] 汇率持久化失败（热生效）: %s", e)
             return self._ok(
                 {
                     "exchange_rates": rates,

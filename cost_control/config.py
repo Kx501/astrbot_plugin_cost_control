@@ -17,7 +17,10 @@
 from __future__ import annotations
 
 import json
+import math
 import os
+import tempfile
+from copy import deepcopy
 from typing import Any
 
 from .default_pricing import DEFAULT_PRICING
@@ -140,12 +143,9 @@ def normalize_budget_override(raw: Any) -> dict[str, Any] | None:
         return None
     try:
         token_limit = max(0, int(raw.get("token_limit", 0) or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         token_limit = 0
-    try:
-        cost_limit = max(0.0, float(raw.get("cost_limit", 0) or 0))
-    except (TypeError, ValueError):
-        cost_limit = 0.0
+    cost_limit = _to_float_or_zero(raw.get("cost_limit", 0))
     on_exceeded = str(raw.get("on_exceeded") or "").strip().lower()
     if on_exceeded not in _VALID_ON_EXCEEDED:
         on_exceeded = "stop"
@@ -161,9 +161,9 @@ def normalize_budget_override(raw: Any) -> dict[str, Any] | None:
                 pids.append(s)
     try:
         fallback_token_limit = max(0, int(raw.get("fallback_token_limit", 0) or 0))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         fallback_token_limit = 0
-    enabled = bool(raw.get("enabled", True))
+    enabled = coerce_to_default_type(raw.get("enabled", True), True)
     # 花费限额的货币代码（空=主货币）。
     cost_currency = str(raw.get("cost_currency", "") or "").strip().upper()
     return {
@@ -188,7 +188,7 @@ def normalize_fallback_provider(raw: Any) -> dict[str, Any] | None:
     if not pid:
         return None
     note = str(raw.get("note", "") or "")
-    enabled = bool(raw.get("enabled", True))
+    enabled = coerce_to_default_type(raw.get("enabled", True), True)
     return {"id": pid, "enabled": enabled, "note": note}
 
 
@@ -280,6 +280,7 @@ def get_pricing(config: dict[str, Any] | None) -> dict[str, Any]:
         "user": user,
         "schedules": schedules,
         "multipliers": multipliers,
+        "exchange_rates": get_rates(config),
     }
 
 
@@ -467,12 +468,16 @@ def _normalize_per_tier(entry: dict[str, Any], currency: str) -> dict[str, Any] 
     if not any(base_cfg.values()):
         return None  # base 全空，无有效阶梯价
     context_tiers: list[dict[str, Any]] = []
-    for t in entry.get("context_tiers") or []:
+    raw_context = entry.get("context_tiers") or []
+    raw_service = entry.get("service_tiers") or []
+    if not isinstance(raw_context, (list, tuple)) or not isinstance(raw_service, (list, tuple)):
+        return None
+    for t in raw_context:
         if not isinstance(t, dict):
             continue
         try:
             threshold = int(t.get("threshold_tokens"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             continue
         if threshold < 0:
             continue
@@ -482,7 +487,7 @@ def _normalize_per_tier(entry: dict[str, Any], currency: str) -> dict[str, Any] 
         context_tiers.append({"threshold_tokens": threshold, **vals})
     context_tiers.sort(key=lambda x: x["threshold_tokens"])
     service_tiers: list[dict[str, Any]] = []
-    for s in entry.get("service_tiers") or []:
+    for s in raw_service:
         if not isinstance(s, dict):
             continue
         match = str(s.get("match") or "").strip()
@@ -492,8 +497,11 @@ def _normalize_per_tier(entry: dict[str, Any], currency: str) -> dict[str, Any] 
         for f in _PER_TOKEN_FIELDS:
             mk = f + "_multiplier"
             if _is_set(s.get(mk)):
-                mv = _to_float_or_zero(s.get(mk))
-                if mv > 0:
+                try:
+                    mv = float(s[mk])
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if math.isfinite(mv) and mv >= 0:
                     mult[mk] = mv
         if mult:
             service_tiers.append({"match": match, **mult})
@@ -534,8 +542,8 @@ def get_pricing_schedules(config: dict[str, Any] | None) -> dict[str, dict[str, 
 def _to_float_or_zero(v: Any) -> float:
     try:
         f = float(v)
-        return f if f >= 0 else 0.0
-    except (TypeError, ValueError):
+        return f if math.isfinite(f) and f >= 0 else 0.0
+    except (TypeError, ValueError, OverflowError):
         return 0.0
 
 
@@ -552,21 +560,16 @@ def deep_merge(base: Any, *overrides: Any) -> Any:
     用于把 ``CONFIG_DEFAULTS`` ⊕ 插件配置文件 ⊕ ``self.config``(开关) 合并为
     运行时 ``self.cfg``。``base`` / ``overrides`` 中非 dict 的项按整体替换处理。
     """
-    if not isinstance(base, dict):
-        # 以第一个 dict 为起点；若全非 dict，返回最后一个 override（或 base）。
-        for ov in overrides:
-            base = ov
-        return base
-    merged: dict[Any, Any] = dict(base)
+    merged = deepcopy(base)
     for ov in overrides:
-        if not isinstance(ov, dict):
-            # 非 dict 覆盖直接整体替换
-            return ov
+        if not isinstance(merged, dict) or not isinstance(ov, dict):
+            merged = deepcopy(ov)
+            continue
         for k, v in ov.items():
             if k in merged and isinstance(merged[k], dict) and isinstance(v, dict):
                 merged[k] = deep_merge(merged[k], v)
             else:
-                merged[k] = v
+                merged[k] = deepcopy(v)
     return merged
 
 
@@ -593,11 +596,19 @@ def load_plugin_config(data_dir: str) -> dict[str, Any]:
 def save_plugin_config(data_dir: str, cfg: dict[str, Any]) -> None:
     """原子写插件自有配置文件（先写临时文件再 ``os.replace``，避免半写损坏）。"""
     path = _config_path(data_dir)
-    tmp = path + ".tmp"
     os.makedirs(data_dir, exist_ok=True)
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, ensure_ascii=False, indent=2, default=str)
-    os.replace(tmp, path)
+    # 独立临时文件避免并发同步/保存相互覆盖同一个 .tmp 文件。
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="w", encoding="utf-8", dir=data_dir, prefix=".config-", delete=False
+        ) as f:
+            tmp = f.name
+            json.dump(cfg, f, ensure_ascii=False, indent=2, default=str, allow_nan=False)
+        os.replace(tmp, path)
+    finally:
+        if tmp is not None and os.path.exists(tmp):
+            os.unlink(tmp)
 
 
 def migration_done(cfg: dict[str, Any] | None, name: str) -> bool:
@@ -653,17 +664,26 @@ def coerce_to_default_type(value: Any, default: Any) -> Any:
     （如 pricing）则接受任意 dict。用于保存配置前的类型校验。
     """
     # 注意：bool 是 int 子类，必须先判 bool。
+    if value is None:
+        return deepcopy(default)
     if isinstance(default, bool):
+        if isinstance(value, str):
+            if value.strip().lower() in ("false", "0", "no", "off", ""):
+                return False
+            if value.strip().lower() in ("true", "1", "yes", "on"):
+                return True
+            return default
         return bool(value)
     if isinstance(default, int):
         try:
             return max(0, int(value))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             return int(default)
     if isinstance(default, float):
         try:
-            return max(0.0, float(value))
-        except (TypeError, ValueError):
+            f = float(value)
+            return max(0.0, f) if math.isfinite(f) else float(default)
+        except (TypeError, ValueError, OverflowError):
             return float(default)
     if isinstance(default, str):
         return str(value)

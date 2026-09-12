@@ -605,3 +605,130 @@ def test_check_budget_per_model_daily_unknown_model_counts_zero():
     result = asyncio.run(host.check_budget("u", None, event=None))
     assert result["exceeded"] is False
     assert host.model_queries == []
+
+
+def test_truncate_contexts_drops_single_history_item_that_exceeds_limit():
+    assert truncate_contexts(["a" * 400], 20) == []
+
+
+@pytest.mark.asyncio
+async def test_unlimited_first_override_replaces_later_rules_and_global_budget():
+    host = _BudgetQueryHost(None)
+    host.cfg = {
+        "budgets": {"global_daily": 1},
+        "budget_overrides": [
+            {"target_type": "umo", "target_value": "s", "enabled": True},
+            {"target_type": "umo", "target_value": "s", "enabled": True, "token_limit": 1},
+        ],
+    }
+    host.get_pricing = lambda: {}
+    host.rows_by_filter = {"umo": _SESSION_OVER_LIMIT, "global": _SESSION_OVER_LIMIT}
+    assert (await host.check_budget("s", None))["exceeded"] is False
+
+
+@pytest.mark.asyncio
+async def test_global_fallback_uses_enabled_provider_library_in_order():
+    host = _BudgetQueryHost(None)
+    host.cfg = {
+        "budgets": {"global_daily": 1},
+        "default_on_exceeded": "fallback",
+        "fallback_providers": [
+            {"id": "cheap", "enabled": True},
+            {"id": "disabled", "enabled": False},
+            {"id": "cheapest", "enabled": True},
+        ],
+    }
+    host.rows_by_filter = {"global": _SESSION_OVER_LIMIT}
+    result = await host.check_budget("s", None)
+    assert result["exceeded"] is True
+    assert result["fallback_provider_ids"] == ["cheap", "cheapest"]
+
+
+@pytest.mark.asyncio
+async def test_fallback_provider_internal_typeerror_does_not_repeat_paid_call():
+    calls = 0
+
+    async def text_chat(**kwargs):
+        nonlocal calls
+        calls += 1
+        raise TypeError("provider response parser failed")
+
+    with pytest.raises(TypeError, match="response parser"):
+        await BudgetMixin()._call_fallback(SimpleNamespace(text_chat=text_chat), object(), 0)
+    assert calls == 1
+
+
+@pytest.mark.asyncio
+async def test_fallback_accepts_legacy_provider_signature_before_calling():
+    async def text_chat(prompt, system_prompt):
+        return prompt + system_prompt
+
+    result = await BudgetMixin()._call_fallback(
+        SimpleNamespace(text_chat=text_chat),
+        SimpleNamespace(prompt="p", system_prompt="s", contexts=["history"]),
+        0,
+    )
+    assert result == "ps"
+
+
+@pytest.mark.asyncio
+async def test_fallback_response_writes_native_stats_and_uses_actual_provider_model():
+    saved_native = []
+    stamp = datetime(2026, 9, 1, tzinfo=UTC)
+
+    async def insert_provider_stat(**kwargs):
+        saved_native.append(kwargs)
+        return SimpleNamespace(created_at=stamp)
+
+    host = _FallbackRecordStub({})
+    host.context = SimpleNamespace(
+        get_db=lambda: SimpleNamespace(insert_provider_stat=insert_provider_stat)
+    )
+    provider = SimpleNamespace(
+        meta=lambda: SimpleNamespace(id="cheap", model="stale"),
+        get_model=lambda: "actual-model",
+    )
+    response = SimpleNamespace(usage=SimpleNamespace(input_other=12, input_cached=3, output=7))
+    await host._record_fallback(
+        SimpleNamespace(unified_msg_origin="s"), provider, "cheap", response
+    )
+    assert saved_native[0]["provider_model"] == "actual-model"
+    assert saved_native[0]["stats"]["token_usage"] == {
+        "input_other": 12,
+        "input_cached": 3,
+        "output": 7,
+    }
+    assert host.saved[0]["created_at"] == stamp
+    assert host.saved[0]["provider_model"] == "actual-model"
+
+
+@pytest.mark.asyncio
+async def test_fallback_response_without_text_is_still_charged():
+    recorded = []
+    host = BudgetMixin()
+    host.context = SimpleNamespace(get_provider_by_id=lambda pid: object())
+
+    async def call(prov, req, token_limit):
+        return SimpleNamespace(completion_text="")
+
+    async def record(event, prov, pid, response):
+        recorded.append(pid)
+
+    host._call_fallback = call
+    host._record_fallback = record
+    assert await host._try_fallback(object(), object(), ["first", "second"], 0) is False
+    assert recorded == ["first", "second"]
+
+
+def test_day_window_dst_gap_never_returns_future_start():
+    tz = ZoneInfo("America/New_York")
+    # Spring gap: 02:30 is normalized to 03:30, which has not arrived at 03:00.
+    now = datetime(2026, 3, 8, 7, 0, tzinfo=UTC)
+    assert day_window_start("02:30", now, tz) == datetime(2026, 3, 7, 7, 30, tzinfo=UTC)
+
+
+def test_day_window_dst_fold_does_not_reset_budget_twice():
+    tz = ZoneInfo("America/New_York")
+    # At the second 01:15, the first 01:30 refresh already happened.
+    now = datetime(2026, 11, 1, 6, 15, tzinfo=UTC)
+    assert day_window_start("01:30", now, tz) == datetime(2026, 11, 1, 5, 30, tzinfo=UTC)

@@ -19,12 +19,19 @@ export const CURRENCY_SYMBOLS: Record<string, string> = {
 // 可选货币列表（下拉选项用）
 export const CURRENCY_OPTIONS = Object.keys(CURRENCY_SYMBOLS);
 
+// Legacy configs store symbols; dropdowns and draft defaults require ISO codes.
+export function currencyToCode(value?: string | null): string {
+  const raw = String(value || "").trim().toUpperCase();
+  if (!raw) return "USD";
+  if (raw in CURRENCY_SYMBOLS) return raw;
+  return Object.entries(CURRENCY_SYMBOLS).find(([, symbol]) => symbol === raw)?.[0] ?? raw;
+}
+
 // 模块级主货币代码，App 挂载时通过 setCurrencyCode 注入
 let _currencyCode = "USD";
 
 export function setCurrencyCode(code: string): void {
-  const c = String(code || "").trim().toUpperCase();
-  if (c) _currencyCode = c;
+  _currencyCode = currencyToCode(code);
 }
 
 export function getCurrencyCode(): string {

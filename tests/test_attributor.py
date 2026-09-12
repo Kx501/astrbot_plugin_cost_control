@@ -176,3 +176,36 @@ def test_pop_injection_without_initial_returns_none():
     m = _mixin()
     req = _FakeReq(system_prompt="A")
     assert m.pop_injection(req, umo="u2") is None
+
+
+def test_event_attribution_isolated_for_concurrent_and_unsampled_requests():
+    from types import SimpleNamespace
+
+    m = _mixin()
+    first, second = SimpleNamespace(), SimpleNamespace()
+    req1, req2 = _FakeReq(prompt="a"), _FakeReq(prompt="b" * 100)
+    m.record_initial_context(req1)
+    expected = m.pop_injection(req1, "same-session", event=first)
+    m.record_initial_context(req2)
+    m.pop_injection(req2, "same-session", event=second)
+    assert first._cost_control_injection is expected
+    assert first._cost_control_injection != second._cost_control_injection
+    m.cfg = {"attribution": {"sample_rate": 0}}
+    m.record_initial_context(req2)
+    assert m.pop_injection(req2, "same-session", event=second) is None
+    assert second._cost_control_injection is None
+
+
+def test_context_estimate_includes_tool_call_arguments():
+    messages = [{"role": "assistant", "content": None, "tool_calls": [
+        {"function": {"name": "search", "arguments": "x" * 2000}},
+    ]}]
+    assert estimate_tokens(messages) >= 500
+
+
+def test_context_estimate_includes_tool_parameter_schema():
+    from types import SimpleNamespace
+
+    m = _mixin()
+    tool = SimpleNamespace(openai_schema=lambda: [{"parameters": {"description": "x" * 2000}}])
+    assert m.snapshot_context(_FakeReq(func_tool=tool))["tools"] >= 500

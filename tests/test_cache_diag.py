@@ -376,3 +376,42 @@ async def test_cache_event_query_empty():
     store = StoreMixin()
     store._session_maker = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
     assert await store.query_cache_events(limit=10) == []
+
+
+def test_system_prompt_addition_and_removal_are_diagnosed():
+    for old, new in (("", "added"), ("removed", "")):
+        events = diagnose_changes(_sig(1, system_hash=new), _sig(1, system_hash=old), {})
+        assert any(e["type"] == "system_prompt_change" for e in events)
+
+
+def test_context_signature_includes_roles_and_tool_calls():
+    from types import SimpleNamespace
+
+    from cost_control.cache_diag import CacheDiagMixin
+
+    m = CacheDiagMixin()
+    req = SimpleNamespace(contexts=[{"role": "user", "content": "same"}])
+    old = m._context_signature(req)
+    req.contexts[0]["role"] = "assistant"
+    assert m._context_signature(req)["contexts_hashes"] != old["contexts_hashes"]
+    req.contexts[0]["tool_calls"] = [{"id": "call-1"}]
+    new = m._context_signature(req)
+    assert new["contexts_hashes"] != old["contexts_hashes"]
+
+
+def test_tool_signature_includes_enum_and_untruncated_description():
+    from types import SimpleNamespace
+
+    from cost_control.cache_diag import CacheDiagMixin
+
+    m = CacheDiagMixin()
+    tool = {"name": "t", "description": "x" * 250, "parameters": {
+        "properties": {"size": {"type": "string", "enum": ["small"]}},
+    }}
+    req = SimpleNamespace(func_tool=[tool])
+    old = m._context_signature(req)
+    tool["parameters"]["properties"]["size"]["enum"] = ["large"]
+    middle = m._context_signature(req)
+    assert middle["tools_hash"] != old["tools_hash"]
+    tool["description"] += "changed"
+    assert m._context_signature(req)["tools_hash"] != middle["tools_hash"]

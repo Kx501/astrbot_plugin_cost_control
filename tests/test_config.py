@@ -204,3 +204,81 @@ def test_get_pricing_includes_normalized_cluster_multipliers():
         }
     )
     assert pricing["multipliers"] == {"openai-main": 1.25, "free": 0.0}
+
+
+def test_deep_merge_isolates_mutable_defaults_and_overrides():
+    base = {"group": {"enabled": True}, "rows": []}
+    override = {"price": {"input": 2}}
+    merged = deep_merge(base, override)
+    merged["group"]["enabled"] = False
+    merged["rows"].append(1)
+    merged["price"]["input"] = 9
+    assert base == {"group": {"enabled": True}, "rows": []}
+    assert override == {"price": {"input": 2}}
+    assert deep_merge({}, 1, {"final": 2}) == {"final": 2}
+
+
+def test_coerce_partial_group_preserves_nonzero_defaults():
+    assert coerce_to_default_type({}, {"enabled": True, "time": "09:00", "rate": 100}) == {
+        "enabled": True, "time": "09:00", "rate": 100,
+    }
+    assert coerce_to_default_type("false", True) is False
+    assert coerce_to_default_type(float("inf"), 5) == 5
+    assert coerce_to_default_type(float("nan"), 2.5) == 2.5
+
+
+def test_service_tier_accepts_explicit_free_but_not_invalid_multiplier():
+    rule = get_pricing({"pricing": {"p": {
+        "mode": "per_tier", "base": {"input": 2}, "service_tiers": [
+            {"match": "free", "input_multiplier": 0},
+            {"match": "bad", "input_multiplier": float("inf")},
+            {"match": "negative", "input_multiplier": -1},
+        ],
+    }}})["user"]["p"]
+    assert rule["service_tiers"] == [{"match": "free", "input_multiplier": 0.0}]
+
+
+def test_config_write_invalid_number_preserves_existing_file(tmp_path):
+    import pytest
+
+    save_plugin_config(str(tmp_path), {"rate": 1})
+    with pytest.raises(ValueError):
+        save_plugin_config(str(tmp_path), {"rate": float("nan")})
+    assert load_plugin_config(str(tmp_path)) == {"rate": 1}
+    assert list(tmp_path.iterdir()) == [tmp_path / "config.json"]
+
+
+def test_concurrent_config_writes_use_distinct_temporary_files(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    barrier = Barrier(2)
+    replace = os.replace
+
+    def simultaneous_replace(src, dest):
+        barrier.wait(timeout=5)
+        replace(src, dest)
+
+    monkeypatch.setattr(os, "replace", simultaneous_replace)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        tasks = [pool.submit(save_plugin_config, str(tmp_path), {"value": n}) for n in (1, 2)]
+        for task in tasks:
+            task.result(timeout=10)
+    assert load_plugin_config(str(tmp_path)) in ({"value": 1}, {"value": 2})
+
+
+def test_malformed_rule_does_not_break_other_pricing_or_budget_rules():
+    from cost_control.config import enabled_overrides, normalize_budget_override
+
+    pricing = get_pricing({"pricing": {
+        "bad": {"mode": "per_tier", "base": {"input": 2}, "context_tiers": 42},
+        "good": {"mode": "per_turn", "price": 3},
+    }})
+    assert "bad" not in pricing["user"]
+    assert pricing["user"]["good"]["price"] == 3
+    rule = {"target_type": "umo", "target_value": "session", "token_limit": float("inf"),
+            "cost_limit": float("inf"), "fallback_token_limit": float("inf")}
+    normalized = normalize_budget_override(rule)
+    assert normalized["token_limit"] == normalized["cost_limit"] == 0
+    assert normalized["fallback_token_limit"] == 0
+    assert enabled_overrides([{**rule, "enabled": "false"}]) == []

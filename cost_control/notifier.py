@@ -14,8 +14,10 @@ import astrbot 的 ``MessageChain``，保持本模块顶层零 astrbot 硬依赖
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
+from weakref import WeakValueDictionary
 
 from .config import get_config
 
@@ -61,8 +63,8 @@ class NotifierMixin:
         """读取 ``alerts.cooldown_seconds``，解析失败回退 0（不冷却）。"""
         alerts = get_config(getattr(self, "cfg", None), "alerts", {}) or {}
         try:
-            return int(alerts.get("cooldown_seconds", 0) or 0)
-        except (TypeError, ValueError):
+            return int(alerts.get("cooldown_seconds", 0) or 0) if isinstance(alerts, dict) else 0
+        except (TypeError, ValueError, OverflowError):
             return 0
 
     async def notify(self, event: AstrMessageEvent, message: str) -> bool:
@@ -78,25 +80,31 @@ class NotifierMixin:
         umo = str(
             getattr(event, "unified_msg_origin", None) or getattr(event, "session_id", None) or ""
         )
-        now = datetime.now(UTC)
-        # 先标记冷却再发送（消除 check-then-mark 竞态：并发告警最多一条发出）；
-        # 发送失败则回滚冷却（ts=0 使冷却判定立即通过），下次仍可重试。
-        if not await self._check_cooldown(umo, now):
-            return False
-        await self._mark_cooldown(umo, now)
-        try:
-            from astrbot.api.event import MessageChain
-
-            chain = MessageChain().message(message)
-            send = getattr(event, "send", None)
-            if send is None:
-                await self._mark_cooldown(umo, datetime.fromtimestamp(0, tz=UTC))
+        # 读 Preference 和写 Preference 都会让出事件循环，必须把检查、发送与
+        # 标记放在同一会话锁中。弱引用表使空闲会话的锁自动释放，避免长期增长。
+        locks = getattr(self, "_notification_locks", None)
+        if locks is None:
+            locks = self._notification_locks = WeakValueDictionary()
+        lock = locks.get(umo)
+        if lock is None:
+            lock = asyncio.Lock()
+            locks[umo] = lock
+        async with lock:
+            now = datetime.now(UTC)
+            if not await self._check_cooldown(umo, now):
                 return False
-            await send(chain)
-        except Exception:
-            await self._mark_cooldown(umo, datetime.fromtimestamp(0, tz=UTC))
-            return False
-        return True
+            try:
+                from astrbot.api.event import MessageChain
+
+                chain = MessageChain().message(message)
+                send = getattr(event, "send", None)
+                if not callable(send):
+                    return False
+                await send(chain)
+            except Exception:
+                return False
+            await self._mark_cooldown(umo, datetime.now(UTC))
+            return True
 
     async def push_to_session(self, umo: str, message: str) -> bool:
         """无 event 主动推送（CronJob / 跨会话场景），不做冷却。

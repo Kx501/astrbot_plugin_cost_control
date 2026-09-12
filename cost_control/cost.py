@@ -261,7 +261,9 @@ def resolve_effective_pricing(
                 ):
                     for field in _PER_TOKEN_FIELDS:
                         if override.get(field) is None:
-                            override[field] = rule.get(field)
+                            override[field] = _inherited_price(
+                                rule.get(field), rule, override, pricing
+                            )
                 rule = override
         if rule is not None:
             rule = dict(rule)
@@ -316,15 +318,16 @@ def _apply_rule_multiplier(rule: dict[str, Any], multiplier: float) -> dict[str,
         return out
     if mode == "per_tier":
         # 结构化深拷贝缩放，绝不修改持久化的 base/context_tiers/service_tiers。
-        # 只缩放绝对单价（base / context tier）；service tier 的字段倍率是规则内部的
-        # 相对系数，对已缩放价格再做倍乘会双重套用聚类倍率，故原样拷贝。
+        # 只缩放绝对单价；service tier 的 *_multiplier 是相对系数，必须原样保留，
+        # 仅目录中无法换算倍率的绝对字段（如基础价为 0）随其它单价一起缩放。
         out["base"] = _scaled_price_map(rule.get("base"), multiplier)
         out["context_tiers"] = [
             _scaled_price_map(t, multiplier) if isinstance(t, dict) else t
             for t in rule.get("context_tiers") or []
         ]
         out["service_tiers"] = [
-            dict(t) if isinstance(t, dict) else t for t in rule.get("service_tiers") or []
+            _scaled_price_map(t, multiplier) if isinstance(t, dict) else t
+            for t in rule.get("service_tiers") or []
         ]
         return out
     if mode == "tiered_expr":
@@ -464,7 +467,12 @@ def _catalog_service_tier_to_rule(
             continue
         value = absolute.get(field)
         base_value = base.get(field)
-        if value is None or base_value in (None, 0):
+        if value is None:
+            continue
+        if base_value in (None, 0):
+            # 免费或缺失的基础字段无法用除法换算倍率，但付费服务档的绝对价
+            # 仍必须保留，不能因为分母为 0 就把该档也按免费算。
+            out[field] = value
             continue
         try:
             out[multiplier_key] = float(value) / float(base_value)
@@ -506,9 +514,14 @@ def _catalog_price_to_rule(price: dict[str, Any]) -> dict[str, Any] | None:
             return None
     cur = str(price.get("currency") or "USD").strip().upper() or "USD"
     if mode == "per_token":
-        return {"mode": "per_token", "currency": cur, **catalog_field_values(price)}
+        fields = catalog_field_values(price)
+        if fields["input_cached"] is None:
+            fields["input_cached"] = fields["input"]
+        return {"mode": "per_token", "currency": cur, **fields}
     if mode == "per_tier":
         base = catalog_field_values(price)
+        if base["input_cached"] is None:
+            base["input_cached"] = base["input"]
         context_tiers = [
             converted
             for raw in (price.get("context_tiers") or [])
@@ -535,6 +548,25 @@ def _catalog_price_to_rule(price: dict[str, Any]) -> dict[str, Any] | None:
     return None
 
 
+def _inherited_price(
+    value: Any,
+    source: dict[str, Any],
+    target: dict[str, Any],
+    pricing: dict[str, Any],
+) -> Any:
+    """继承字段时先统一币种，防止 USD 默认价被直接标记为用户的 CNY 单价。"""
+    if value is None:
+        return None
+    from .exchange_rates import convert
+
+    return convert(
+        value,
+        str(source.get("currency") or "USD"),
+        str(target.get("currency") or "USD"),
+        pricing.get("exchange_rates"),
+    )
+
+
 def _inherit_per_token(
     rule: dict[str, Any], provider_id: str | None, model: str | None, pricing: dict[str, Any]
 ) -> dict[str, Any]:
@@ -555,7 +587,7 @@ def _inherit_per_token(
             continue  # 用户显式提供
         fb = fallback.get(f) if isinstance(fallback, dict) else None
         if fb is not None:
-            out[f] = fb
+            out[f] = _inherited_price(fb, fallback, out, pricing)
         elif f != "cache_creation":
             out[f] = 0.0  # cache_creation 留 None，由 _cost_per_token 回退 input
     return out
@@ -651,6 +683,8 @@ def _cost_per_tier(usage: dict[str, Any], rule: dict[str, Any]) -> float:
             if str(s.get("match", "")).lower() != str(svc).lower():
                 continue
             for f in _PER_TOKEN_FIELDS:
+                if s.get(f) is not None:
+                    prices[f] = s[f]
                 m = s.get(f + "_multiplier")
                 if m is not None and prices.get(f) is not None:
                     prices[f] = float(prices[f]) * float(m)

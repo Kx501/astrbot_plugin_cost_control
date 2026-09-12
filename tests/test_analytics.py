@@ -350,3 +350,47 @@ def test_compare_windows_unknown_defaults_daily():
     daily = day_window_start(refresh, _NOW, _TZ)
     assert prev_start == daily - timedelta(days=1)
     assert prev_end == daily
+
+
+def test_report_windows_keep_local_refresh_time_across_dst():
+    tz = ZoneInfo("America/New_York")
+    now = datetime(2026, 3, 10, 15, tzinfo=UTC)
+    weekly = report_window_start("weekly", now, tz, "09:00")
+    assert weekly == datetime(2026, 3, 4, 14, tzinfo=UTC)
+    current, _, previous, _ = compare_windows("daily", now, tz, "09:00")
+    assert current.astimezone(tz).hour == previous.astimezone(tz).hour == 9
+    dst_day = datetime(2026, 3, 8, 15, tzinfo=UTC)
+    current, _, previous, _ = compare_windows("daily", dst_day, tz, "09:00")
+    assert (current - previous).total_seconds() == 23 * 3600
+
+
+async def test_report_uses_complete_supplement_window_with_consistent_end_time():
+    from types import SimpleNamespace
+
+    from cost_control.analytics import AnalyticsMixin
+
+    host = AnalyticsMixin()
+    host.context = SimpleNamespace(get_config=lambda: {"timezone": "UTC"})
+    host.cfg = {}
+    host.get_pricing = lambda: {}
+    filters = []
+
+    async def usage(**kwargs):
+        filters.append(kwargs)
+        return {"count": 5001}
+
+    async def costs(pricing, **kwargs):
+        filters.append(kwargs)
+        return []
+
+    async def supplements(**kwargs):
+        filters.append(kwargs)
+        assert kwargs["limit"] is None
+        return [SimpleNamespace(umo="old", token_output=1)] * 5001
+
+    host.query_usage = usage
+    host.query_usage_cost_rows = costs
+    host.query_supplements = supplements
+    report = await host.build_report(window="monthly")
+    assert report["top_sessions"][0]["count"] == 5001
+    assert all(f["end"].isoformat() == report["end"] for f in filters)

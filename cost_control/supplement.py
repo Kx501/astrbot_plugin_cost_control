@@ -31,91 +31,68 @@ if TYPE_CHECKING:
 logger = logging.getLogger("cost_control.supplement")
 
 
+def _field(value: Any, key: str, default: Any = None) -> Any:
+    """兼容 SDK 对象与 JSON 字典，不要求供应商使用同一 SDK。"""
+    return value.get(key, default) if isinstance(value, dict) else getattr(value, key, default)
+
+
+def _token_count(value: Any) -> int | None:
+    try:
+        count = int(value)
+        return count if count >= 0 else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
 def _extract_cache(
     raw: Any,
 ) -> tuple[int | None, int | None, dict[str, Any] | None, int | None]:
-    """从 raw_completion 提取 cache 细分与原始 usage。
+    """提取缓存写、读、原始用量及 1h 写入细分，兼容对象和字典响应。
 
-    按 provider 类型 duck-typing，逐个尝试已知字段路径；全部失败返回
-    ``(None, None, raw_usage, None)``。
-
-    注意（已对照 AstrBot 4.25.5 ``openai_source._extract_usage``）：
-    ``TokenUsage.input_other = prompt_tokens - cached_tokens`` 已包含缓存
-    未命中的输入 token。DeepSeek 系（``prompt_cache_hit_tokens`` /
-    ``prompt_cache_miss_tokens``）的 miss token 同样已计入 ``input_other``
-    （其响应无 ``prompt_tokens_details``，AstrBot 取不到 hit 数）——因此
-    ``prompt_cache_miss_tokens`` **不得**映射为 ``cache_creation``，否则同一段
-    token 按 input + cache_creation 收两遍（≈2 倍；DeepSeek 缓存本无写入费）。
-
-    Returns:
-        ``(cache_creation, cache_read, raw_usage_dict, cache_creation_1h)``。
-        ``cache_creation_1h`` 来自 Anthropic ``usage.cache_creation.
-        ephemeral_1h_input_tokens``（1h 缓存写，2× 价）；无该细分返回 None。
+    DeepSeek 的 miss 属于普通输入，不能当作额外缓存写入收费。
+    每个字段独立解析，坏字段不应掩盖其他有效用量。
     """
-    if raw is None:
-        return None, None, None, None
-
-    usage = getattr(raw, "usage", None)  # OpenAI / Anthropic
-    usage_meta = getattr(raw, "usage_metadata", None)  # Google
-
-    raw_usage_dict: dict[str, Any] | None = None
+    usage = _field(raw, "usage")
+    usage_meta = _field(raw, "usage_metadata")
+    raw_usage = None
+    source = usage if usage is not None else usage_meta
     try:
-        if usage is not None and hasattr(usage, "model_dump"):
-            raw_usage_dict = usage.model_dump()
-    except Exception:
-        raw_usage_dict = None
-
-    cache_creation: int | None = None
-    cache_read: int | None = None
-    cache_creation_1h: int | None = None
-
-    try:
-        if usage is not None:
-            # Anthropic 风格：原生 cache_creation / cache_read
-            cc = getattr(usage, "cache_creation_input_tokens", None)
-            cr = getattr(usage, "cache_read_input_tokens", None)
-            if cc is not None:
-                cache_creation = int(cc)
-            if cr is not None:
-                cache_read = int(cr)
-            # Anthropic 缓存写细分：usage.cache_creation.ephemeral_1h_input_tokens
-            # （CacheCreation 对象；SDK >= 0.62）。请求侧 ProviderRequest 无
-            # headers/extra_body 可判定 1h（4.25.5 实测），响应侧细分是唯一信号。
-            ccd = getattr(usage, "cache_creation", None)
-            if ccd is not None:
-                e1h = getattr(ccd, "ephemeral_1h_input_tokens", None)
-                if e1h is None and isinstance(ccd, dict):
-                    e1h = ccd.get("ephemeral_1h_input_tokens")
-                if e1h is not None:
-                    cache_creation_1h = int(e1h)
-            # OpenAI 风格：prompt_tokens_details.cached_tokens
-            if cache_read is None:
-                ptd = getattr(usage, "prompt_tokens_details", None)
-                cached = getattr(ptd, "cached_tokens", None) if ptd is not None else None
-                if cached is not None:
-                    cache_read = int(cached)
-            # OpenAI Responses API 风格：input_tokens_details.cached_tokens
-            # （openai_responses 供应商的 raw_completion 是 Response 对象）
-            if cache_read is None:
-                itd = getattr(usage, "input_tokens_details", None)
-                cached = getattr(itd, "cached_tokens", None) if itd is not None else None
-                if cached is not None:
-                    cache_read = int(cached)
-            # DeepSeek 等扩展字段（部分 provider 直接挂在 usage 上）。
-            # 只取 hit 作 cache_read；miss 留在 input_other（见 docstring）。
-            if cache_read is None:
-                dsh = getattr(usage, "prompt_cache_hit_tokens", None)
-                if dsh is not None:
-                    cache_read = int(dsh)
-        # Google 风格：usage_metadata.cached_content_token_count
-        if usage_meta is not None and cache_read is None:
-            ccc = getattr(usage_meta, "cached_content_token_count", None)
-            if ccc is not None:
-                cache_read = int(ccc)
+        if isinstance(source, dict):
+            raw_usage = dict(source)
+        elif source is not None and hasattr(source, "model_dump"):
+            raw_usage = source.model_dump()
     except Exception:
         pass
 
-    return cache_creation, cache_read, raw_usage_dict, cache_creation_1h
+    cache_creation = _token_count(_field(usage, "cache_creation_input_tokens"))
+    cache_creation_1h = _token_count(
+        _field(_field(usage, "cache_creation"), "ephemeral_1h_input_tokens")
+    )
+    cache_read = None
+    for value in (
+        _field(usage, "cache_read_input_tokens"),
+        _field(_field(usage, "prompt_tokens_details"), "cached_tokens"),
+        _field(_field(usage, "input_tokens_details"), "cached_tokens"),
+        _field(usage, "prompt_cache_hit_tokens"),
+        _field(usage_meta, "cached_content_token_count"),
+    ):
+        parsed = _token_count(value)
+        if parsed is not None:
+            cache_read = parsed
+            break
+    return cache_creation, cache_read, raw_usage, cache_creation_1h
+
+
+def _normalize_usage(usage: Any, cache_read: int | None) -> tuple[int, int, int]:
+    """补齐宿主未识别的缓存命中分量，保持 TokenUsage 总输入不变。"""
+    other = _token_count(_field(usage, "input_other")) or 0
+    cached = _token_count(_field(usage, "input_cached")) or 0
+    output = _token_count(_field(usage, "output")) or 0
+    # 例如 DeepSeek 的 hit 扩展没有被 AstrBot 映射到 input_cached。
+    # 已有缓存分量时保留宿主结果，以免把多步聚合用量替换成单步 raw 用量。
+    if cached == 0 and cache_read is not None and 0 <= cache_read <= other:
+        cached, other = cache_read, other - cache_read
+    return other, cached, output
 
 
 def _safe_sender_id(event: Any) -> str | None:
@@ -195,6 +172,34 @@ def _extract_billing_context(
         return {}
 
 
+def _active_agent_usage(event: Any) -> tuple[int, int, int] | None:
+    """读取同一事件的内部 agent 累计用量；宿主接口不可用时保留响应采样。
+
+    AstrBot 4.25.5 的 OnLLMResponse 在 agent 结束时仅提供最终一轮响应，
+    累计值保存在活动 runner.stats。该注册表是宿主私有兼容路径，必须验证
+    event 对象身份，不能仅凭 UMO 把并发请求或后续消息的用量归给当前用户。
+    """
+    try:
+        from astrbot.core.pipeline.process_stage.follow_up import _ACTIVE_AGENT_RUNNERS
+
+        umo = str(getattr(event, "unified_msg_origin", None) or "")
+        runner = _ACTIVE_AGENT_RUNNERS.get(umo)
+        context = getattr(getattr(runner, "run_context", None), "context", None)
+        if runner is None or getattr(context, "event", None) is not event:
+            return None
+        usage = getattr(getattr(runner, "stats", None), "token_usage", None)
+        if usage is None:
+            return None
+        other = _token_count(_field(usage, "input_other"))
+        cached = _token_count(_field(usage, "input_cached"))
+        output = _token_count(_field(usage, "output"))
+        if other is None or cached is None or output is None:
+            return None
+        return other, cached, output
+    except Exception:
+        return None
+
+
 class SupplementMixin:
     """``on_llm_response`` 钩子补充采集 usage + cache 字段的 Mixin。"""
 
@@ -220,17 +225,26 @@ class SupplementMixin:
         from .cost import TieredExprEvaluationError, compute_cost_with_currency
 
         usage = getattr(resp, "usage", None)
-        token_input_other = int(getattr(usage, "input_other", 0) or 0)
-        token_input_cached = int(getattr(usage, "input_cached", 0) or 0)
-        token_output = int(getattr(usage, "output", 0) or 0)
-
         raw = getattr(resp, "raw_completion", None)
         cache_creation, cache_read, raw_usage, cache_creation_1h = _extract_cache(raw)
+        token_input_other, token_input_cached, token_output = _normalize_usage(usage, cache_read)
+        total_usage = _active_agent_usage(event)
+        response_usage = _normalize_usage(usage, None)
+        has_prior_usage = total_usage is not None and sum(total_usage) > sum(response_usage)
+        if total_usage is not None and has_prior_usage:
+            # 仅补齐最终一轮可以确证的缓存分类差值，不能用最终 raw 的缓存量
+            # 代替整个 agent 的累计缓存命中，也不修改宿主共享的 TokenUsage。
+            cached_delta = token_input_cached - response_usage[1]
+            token_input_other, token_input_cached, token_output = total_usage
+            cached_delta = min(max(0, cached_delta), token_input_other)
+            token_input_other -= cached_delta
+            token_input_cached += cached_delta
+            cache_read = token_input_cached
 
         umo = self._get_umo(event)
         conversation_id = self._get_conversation_id(event)
-        provider_id, provider_model = await self._get_provider_info(umo, raw)
-        response_id = getattr(resp, "id", None)
+        provider_id, provider_model = await self._get_provider_info(umo, raw, event=event)
+        response_id = getattr(resp, "id", None) or _field(raw, "id")
         user_id = _safe_sender_id(event)
         request_id = _read_request_id(event)
 
@@ -238,6 +252,12 @@ class SupplementMixin:
         # 全部来自响应侧（ProviderRequest 无 extra_body/headers 可提取，见
         # _extract_billing_context docstring）。
         billing_context = _extract_billing_context(raw, cache_creation_1h)
+        if has_prior_usage:
+            billing_context["collection"] = {
+                "usage_scope": "agent_run",
+                "raw_usage_scope": "final_response",
+                "cache_creation_scope": "final_response",
+            }
         bc_params = billing_context.get("params") if isinstance(billing_context, dict) else None
         bc_params = bc_params if isinstance(bc_params, dict) else {}
         # 1h 缓存写：优先 Anthropic 响应侧 ephemeral_1h 细分；provider 未返回
@@ -318,7 +338,13 @@ class SupplementMixin:
         self,
         umo: str | None,
         raw: Any,
+        *,
+        event: Any = None,
     ) -> tuple[str | None, str | None]:
+        captured = getattr(event, "_cost_control_provider", None)
+        if captured is not None:
+            provider_id, model = captured
+            return provider_id, model or _field(raw, "model")
         provider_id: str | None = None
         model: str | None = None
         try:
@@ -331,10 +357,20 @@ class SupplementMixin:
             pass
         if model is None and raw is not None:
             try:
-                model = getattr(raw, "model", None)
+                model = _field(raw, "model")
             except Exception:
                 model = None
         return provider_id, model
+
+    def record_request_provider(self, event: Any, req: Any) -> None:
+        """在请求尾部固定 Provider/模型，防止等待响应期间切换模型导致记错账。"""
+        try:
+            prov = self.context.get_using_provider(self._get_umo(event))
+            meta = prov.meta() if prov is not None else None
+            model = getattr(req, "model", None) or getattr(meta, "model", None)
+            event._cost_control_provider = (getattr(meta, "id", None), model)
+        except Exception:
+            event._cost_control_provider = None
 
     def ensure_request_id(self, event: Any) -> None:
         """为一次用户请求（pipeline）生成 request_id 并挂到 event（幂等、绝不抛异常）。

@@ -46,6 +46,49 @@ def test_expr_to_python_empty():
         ee.expr_to_python("   ")
 
 
+@pytest.mark.parametrize("tokens, expected", [(0, 4), (5, 10)])
+def test_ternary_as_unparenthesized_function_argument(tokens, expected):
+    value, tier = ee.eval_tiered_expr('tier("named", max(p > 0 ? p * 2 : 1, 4))', {"p": tokens})
+    assert value == expected
+    assert tier == "named"
+
+
+def test_unknown_names_are_rejected_even_in_unvisited_branches():
+    assert ee.validate_tiered_expr("p == 12345 ? missing_rate : p") is not None
+
+
+@pytest.mark.parametrize("bad_value", ["-1", "1e309", "1e309 - 1e309"])
+def test_runtime_rejects_invalid_amounts_outside_validation_vectors(bad_value):
+    expr = f"p == 12345 ? {bad_value} : p"
+    assert ee.validate_tiered_expr(expr) is None
+    with pytest.raises(ValueError):
+        ee.eval_tiered_expr(expr, {"p": 12345})
+
+
+def test_time_functions_accept_serialized_timestamp():
+    value, _ = ee.eval_tiered_expr(
+        'hour("Asia/Shanghai") * 100 + minute("Asia/Shanghai")',
+        {},
+        {"created_at": "2023-11-14T22:13:20+00:00"},
+    )
+    assert value == 613
+
+
+@pytest.mark.parametrize("created_at", [None, "bad-date", float("nan"), float("inf")])
+def test_time_functions_do_not_guess_a_missing_billing_timestamp(created_at):
+    with pytest.raises(ValueError, match="created_at"):
+        ee.eval_tiered_expr("hour()", {}, {"created_at": created_at})
+
+
+def test_epoch_zero_is_a_valid_billing_timestamp():
+    assert ee.eval_tiered_expr("month()", {}, {"created_at": 0})[0] == 1
+
+
+@pytest.mark.parametrize("offset", [24, -24, float("inf"), float("nan")])
+def test_invalid_numeric_timezone_falls_back_to_utc(offset):
+    assert ee._parse_tz(offset) is UTC
+
+
 # ---- New API 官方测试向量（RunExpr 原始输出，未 /1M）----
 
 CLAUDE = (
@@ -376,6 +419,18 @@ def test_string_repeat_bomb_blocked_at_eval():
         ee.eval_tiered_expr(bomb, {}, {})
 
 
+@pytest.mark.parametrize(
+    "expr, context",
+    [
+        ('has(header("x") * 10001, "a") ? 8 : 2', {"headers": {"x": "a"}}),
+        ('has(param("x") * 10001, "a") ? 8 : 2', {"params": {"x": "a"}}),
+    ],
+)
+def test_context_strings_are_subject_to_the_same_allocation_limit(expr, context):
+    with pytest.raises(ValueError, match="字符串运算结果过长"):
+        ee.eval_tiered_expr(expr, {}, context)
+
+
 def test_small_string_repeat_still_works():
     val, _ = ee.eval_tiered_expr('has("ab"*3, "abab") ? 8 : 2', {}, {})
     assert val == pytest.approx(8)
@@ -388,5 +443,5 @@ def test_string_concat_bounded():
 
 def test_overlong_string_literal_rejected():
     # 超长字面量先被 4000 字符总长拦截（字面量 10k 上限是纵深防御）。
-    msg = ee.validate_tiered_expr(f'has("{"x"*20001}", "x") ? 8 : 2')
+    msg = ee.validate_tiered_expr(f'has("{"x" * 20001}", "x") ? 8 : 2')
     assert msg is not None

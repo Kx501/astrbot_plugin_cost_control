@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import UTC, datetime
 from typing import Any
 
@@ -91,6 +92,8 @@ def convert(
         amount = float(amount)
     except (TypeError, ValueError):
         amount = 0.0
+    if not math.isfinite(amount):
+        return 0.0
     fc = str(from_cur or "").strip().upper()
     tc = str(to_cur or "").strip().upper()
     if not fc or not tc or fc == tc:
@@ -118,7 +121,7 @@ def _lookup_rate(cur: str, rates: dict[str, float]) -> float | None:
         f = float(v)
     except (TypeError, ValueError):
         return None
-    return f if f > 0 else None
+    return f if math.isfinite(f) and f > 0 else None
 
 
 def get_main_currency(cfg: Any) -> str:
@@ -140,9 +143,13 @@ def get_rates(cfg: Any) -> dict[str, float]:
     if isinstance(raw, dict):
         for k, v in raw.items():
             try:
-                out[str(k)] = float(v)
+                value = float(v)
             except (TypeError, ValueError):
                 continue
+            code = str(k).strip().upper()
+            if code and math.isfinite(value) and value > 0:
+                out[code] = value
+    out["USD"] = 1.0
     return out
 
 
@@ -191,9 +198,14 @@ def _sync_rates_blocking(timeout: float) -> tuple[dict[str, float], str, str]:
         rates: dict[str, float] = {}
         for k, v in raw_rates.items():
             try:
-                rates[str(k).upper()] = float(v)
+                value = float(v)
             except (TypeError, ValueError):
                 continue
+            code = str(k).strip().upper()
+            if code and math.isfinite(value) and value > 0:
+                rates[code] = value
+        if not any(code != "USD" for code in rates):
+            return dict(DEFAULT_RATES), "", "汇率 API 未返回有效汇率"
         # 确保基准 USD=1.0
         rates["USD"] = 1.0
         updated_at = datetime.now(UTC).isoformat()

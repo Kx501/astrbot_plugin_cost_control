@@ -56,16 +56,12 @@ def _bucket_key(created: Any, bucket: str) -> str | None:
     if created is None:
         return None
     try:
-        dt = created
-        if isinstance(dt, datetime):
-            iso = dt.isoformat(sep=" ")
-        else:
-            iso = str(dt)
-        # datetime.isoformat / 标准字符串均以 ``YYYY-MM-DD`` 开头
-        day = iso[:10]
+        dt = created if isinstance(created, datetime) else datetime.fromisoformat(str(created))
+        # 与 SQL strftime 一致：带偏移时间转 UTC，SQLite 无时区值按 UTC 解释。
+        dt = dt.astimezone(UTC) if dt.tzinfo is not None else dt.replace(tzinfo=UTC)
+        day = dt.strftime("%Y-%m-%d")
         if bucket == "hour":
-            hour = iso[11:13] if len(iso) >= 13 else "00"
-            return f"{day} {hour}:00"
+            return f"{day} {dt:%H}:00"
         return day
     except Exception:
         return None
@@ -343,13 +339,16 @@ class UsageQueryMixin:
         schedules = pricing.get("schedules") if isinstance(pricing, dict) else None
         scheduled = scheduled_provider_ids(schedules)
         if not scheduled:
-            return await self.query_usage_grouped(
+            rows = await self.query_usage_grouped(
                 by="provider_model",
                 umo=umo,
                 provider=provider,
                 model=model,
                 start=start,
                 end=end,
+            )
+            return await self._expand_nonlinear_cost_rows(
+                pricing, rows, umo=umo, provider=provider, model=model, start=start, end=end
             )
 
         from astrbot.core.db.po import ProviderStat
@@ -407,7 +406,9 @@ class UsageQueryMixin:
                         "created_at": created_at,
                     }
                 )
-            return out
+            return await self._expand_nonlinear_cost_rows(
+                pricing, out, umo=umo, provider=provider, model=model, start=start, end=end
+            )
         except Exception:
             return []
 
@@ -579,13 +580,23 @@ class UsageQueryMixin:
         schedules = pricing.get("schedules") if isinstance(pricing, dict) else None
         scheduled = scheduled_provider_ids(schedules)
         if not scheduled:
-            return await self.query_usage_timeseries_by_model(
+            rows = await self.query_usage_timeseries_by_model(
                 start=start,
                 end=end,
                 bucket=bucket,
                 umo=umo,
                 provider=provider,
                 model=model,
+            )
+            return await self._expand_nonlinear_cost_rows(
+                pricing,
+                rows,
+                umo=umo,
+                provider=provider,
+                model=model,
+                start=start,
+                end=end,
+                bucket=bucket,
             )
 
         from astrbot.core.db.po import ProviderStat
@@ -655,6 +666,96 @@ class UsageQueryMixin:
                     }
                 )
             out.sort(key=lambda item: (item["bucket"], item["provider_model"]))
-            return out
+            return await self._expand_nonlinear_cost_rows(
+                pricing,
+                out,
+                umo=umo,
+                provider=provider,
+                model=model,
+                start=start,
+                end=end,
+                bucket=bucket,
+            )
         except Exception:
             return []
+
+    async def _expand_nonlinear_cost_rows(
+        self,
+        pricing: dict[str, Any],
+        rows: list[dict[str, Any]],
+        *,
+        umo: str | None = None,
+        provider: str | None = None,
+        model: str | None = None,
+        start: datetime | None = None,
+        end: datetime | None = None,
+        bucket: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """阶梯与表达式必须逐条计费，先 SUM 会错误改变每次调用命中的档位。"""
+        from .cost import resolve_effective_pricing
+
+        nonlinear = {
+            (str(row.get("provider_id") or ""), str(row.get("provider_model") or ""))
+            for row in rows
+            if (
+                resolve_effective_pricing(
+                    row.get("provider_id"),
+                    row.get("provider_model"),
+                    pricing,
+                    row.get("created_at"),
+                )
+                or {}
+            ).get("mode")
+            in ("per_tier", "tiered_expr")
+        }
+        if not nonlinear:
+            return rows
+
+        from astrbot.core.db.po import ProviderStat
+        from sqlalchemy import tuple_
+        from sqlmodel import func, select
+
+        stmt = select(ProviderStat).where(
+            tuple_(
+                func.coalesce(ProviderStat.provider_id, ""),
+                func.coalesce(ProviderStat.provider_model, ""),
+            ).in_(sorted(nonlinear))
+        )
+        if umo:
+            stmt = stmt.where(ProviderStat.umo == umo)
+        if provider:
+            stmt = stmt.where(ProviderStat.provider_id == provider)
+        if model:
+            stmt = stmt.where(ProviderStat.provider_model == model)
+        if start:
+            stmt = stmt.where(ProviderStat.created_at >= start)
+        if end:
+            stmt = stmt.where(ProviderStat.created_at <= end)
+        async with self.context.get_db().get_db() as session:
+            details = (await session.execute(stmt)).scalars().all()
+        out = [
+            row
+            for row in rows
+            if (str(row.get("provider_id") or ""), str(row.get("provider_model") or ""))
+            not in nonlinear
+        ]
+        for detail in details:
+            created = detail.created_at
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=UTC)
+            row = {
+                "provider_id": str(detail.provider_id or ""),
+                "provider_model": str(detail.provider_model or ""),
+                "key": str(detail.provider_model or ""),
+                "count": 1,
+                "token_input_other": int(detail.token_input_other or 0),
+                "token_input_cached": int(detail.token_input_cached or 0),
+                "token_output": int(detail.token_output or 0),
+                "created_at": created,
+            }
+            if bucket is not None:
+                row["bucket"] = _bucket_key(created, bucket)
+            out.append(row)
+        if bucket is not None:
+            out.sort(key=lambda row: (row["bucket"], row["provider_model"]))
+        return out

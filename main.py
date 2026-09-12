@@ -16,6 +16,8 @@ iscoroutinefunction(handler)`` ——故这些钩子 handler **必须是 corouti
 
 from __future__ import annotations
 
+from copy import deepcopy
+
 from astrbot import logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
@@ -27,6 +29,7 @@ from .cost_control.attributor import AttributorMixin
 from .cost_control.budget import BudgetMixin
 from .cost_control.cache_diag import CacheDiagMixin
 from .cost_control.commands import CommandsMixin
+from .cost_control.config import get_config
 from .cost_control.cost import CostMixin
 from .cost_control.notifier import NotifierMixin
 from .cost_control.schedule import ScheduleMixin
@@ -62,7 +65,20 @@ class Main(
     def __init__(self, context: Context, config) -> None:
         super().__init__(context)
         self.context = context
-        self.config = config or {}
+        self.config = config if config is not None else {}
+
+    def _event_enabled(self, event: AstrMessageEvent) -> bool:
+        """总开关和平台范围统一约束采集、预算与诊断钩子。"""
+        cfg = getattr(self, "cfg", None)
+        if not get_config(cfg, "enabled", True):
+            return False
+        platforms = get_config(cfg, "platforms", []) or []
+        if not platforms:
+            return True
+        try:
+            return event.get_platform_name() in platforms
+        except Exception:
+            return False
 
     async def initialize(self) -> None:
         """插件加载时初始化：构建运行时配置 + 建立独立 sqlite 补充表 + 注册 CronJob + 注册 Web API。
@@ -92,7 +108,7 @@ class Main(
             logger.warning("[cost_control] 加载运行时配置失败，使用默认值: %s", e)
             from .cost_control.config import CONFIG_DEFAULTS
 
-            self.cfg = dict(CONFIG_DEFAULTS)
+            self.cfg = deepcopy(CONFIG_DEFAULTS)
         try:
             await self.init_store()
         except Exception as e:
@@ -133,6 +149,18 @@ class Main(
         except Exception as e:
             logger.warning("[cost_control] Web API 注册失败: %s", e)
 
+    async def terminate(self) -> None:
+        """AstrBot 卸载时显式释放本实例的任务和连接。"""
+        try:
+            await self.unregister_cron()
+        except Exception as e:
+            logger.warning("[cost_control] CronJob 清理失败: %s", e)
+        finally:
+            try:
+                await self.close_store()
+            except Exception as e:
+                logger.warning("[cost_control] 数据库连接关闭失败: %s", e)
+
     @filter.on_llm_request(priority=100000)
     async def on_llm_request_head(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         """LLM 请求前（最高优先级）：预算硬拦截 + 归因初始快照。
@@ -142,6 +170,8 @@ class Main(
         （fallback_provider 逐个尝试备用 Provider，或 stop_llm 拦截）。归因初始
         快照仅在未超限（或链路未处理）时记录。异常一律降级放行，绝不阻断主流程。
         """
+        if not self._event_enabled(event):
+            return
         # 为本次用户请求生成 request_id（per_request 计费用；function-calling 多步复用）。
         # 计费上下文（service_tier / 1h 缓存）改由 on_llm_response 从响应侧解析——
         # ProviderRequest（4.25.5）没有 extra_body/headers，请求侧无从提取。
@@ -176,9 +206,12 @@ class Main(
         在所有高优先级钩子执行完毕后：与 head 快照对比得到本轮各组件注入量，
         并与上一轮上下文签名对比做缓存破坏四类诊断。coroutine，不 yield。
         """
+        if not self._event_enabled(event):
+            return
         try:
             umo = str(getattr(event, "unified_msg_origin", None) or "")
-            self.pop_injection(req, umo)
+            self.record_request_provider(event, req)
+            self.pop_injection(req, umo, event=event)
             await self.run_cache_diag(req, umo)
         except Exception as e:
             logger.warning("[cost_control] LLM 请求尾处理失败: %s", e)
@@ -190,12 +223,15 @@ class Main(
         coroutine（走 ``call_event_hook``），不 yield。任何异常都被捕获并降级
         （仅记录日志），绝不影响 AstrBot 主流程。
         """
+        if not self._event_enabled(event):
+            return
         try:
             record = await self.collect_response(event, resp)
             umo = record.get("umo", "") or ""
             # 把 tail 算出的注入归因挂到本次补充记录
             if umo:
-                inj = self.consume_last_injection(umo)
+                # 每个 event 持有本轮采样，避免同会话并发或未采样请求复用旧值。
+                inj = getattr(event, "_cost_control_injection", None)
                 if inj:
                     record["injection_total"] = inj.get("injected_total")
                     record["attribution"] = inj.get("final")

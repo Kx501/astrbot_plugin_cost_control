@@ -53,6 +53,45 @@ def test_cross_midnight_uses_previous_weekday_for_early_hours():
     assert match_pricing_period(schedule, datetime(2026, 8, 30, 22, 30, tzinfo=UTC)) is None
 
 
+@pytest.mark.parametrize("weekdays", ["1", 1, [1.5], [True], {"monday": 1}])
+def test_malformed_weekdays_do_not_silently_expand_to_every_day(weekdays):
+    raw = {"prov": _raw_schedule([_multiplier_period(weekdays=weekdays)])}
+    with pytest.raises(PricingScheduleValidationError, match="weekdays"):
+        normalize_pricing_schedules(raw, strict=True)
+    assert normalize_pricing_schedules(raw)["prov"]["periods"] == []
+
+
+def test_override_inherits_prices_after_currency_conversion():
+    schedules = normalize_pricing_schedules(
+        {
+            "prov": _raw_schedule(
+                [
+                    _multiplier_period(
+                        all_day=True,
+                        weekdays=[],
+                        adjustment={
+                            "type": "override",
+                            "rule": {"mode": "per_token", "currency": "CNY", "input": 7.0},
+                        },
+                    )
+                ]
+            )
+        },
+        strict=True,
+    )
+    pricing = {
+        "defaults": {"m": {"input": 2.0, "output": 10.0}},
+        "schedules": schedules,
+        "exchange_rates": {"CNY": 7.0},
+    }
+    usage = {
+        "created_at": "2026-08-31T01:00:00+00:00",
+        "token_input_other": 1_000_000,
+        "token_output": 1_000_000,
+    }
+    assert compute_cost_value(usage, "prov", "m", pricing) == 77.0
+
+
 def test_overlap_is_rejected_including_cross_midnight():
     raw = {
         "prov": _raw_schedule(

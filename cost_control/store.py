@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -134,12 +135,37 @@ class StoreMixin:
 
         对已存在的旧库调用一次幂等 ``ALTER TABLE`` 迁移，补充缺失列与索引
         （SQLAlchemy ``create_all(checkfirst=True)`` 只建不存在的表，不加列；
-        新增字段需要手工 ALTER 才能补齐）。任何失败仅记录日志，不阻断插件加载。
+        新增字段需要手工 ALTER 才能补齐）。失败向调用方报告，后续调用可重试。
         """
+        lock = getattr(self, "_store_init_lock", None)
+        if lock is None:
+            lock = self._store_init_lock = asyncio.Lock()
+        async with lock:
+            if getattr(self, "_store_closed", False):
+                raise RuntimeError("cost_control store has been closed")
+            if self._session_maker is not None:
+                return
+            await self._initialize_store()
+
+    async def close_store(self) -> None:
+        """卸载时关闭连接池，并阻止滞后的异步回调重新打开存储。"""
+        lock = getattr(self, "_store_init_lock", None)
+        if lock is None:
+            lock = self._store_init_lock = asyncio.Lock()
+        async with lock:
+            self._store_closed = True
+            engine = self._engine
+            self._engine = None
+            self._session_maker = None
+            if engine is not None:
+                await engine.dispose()
+
+    async def _initialize_store(self) -> None:
+        """在初始化锁内建表；完成前不向并发查询暴露 session maker。"""
         data_dir = self.get_data_dir()
         data_dir.mkdir(parents=True, exist_ok=True)
         db_path = data_dir / "supplement.db"
-        self._engine = create_async_engine(
+        engine = create_async_engine(
             f"sqlite+aiosqlite:///{db_path}",
             echo=False,
             future=True,
@@ -147,30 +173,43 @@ class StoreMixin:
             max_overflow=10,
             connect_args={"timeout": 30, "check_same_thread": False},
         )
-        self._session_maker = async_sessionmaker(
-            self._engine,
-            class_=AsyncSession,
-            expire_on_commit=False,
-        )
-        # 仅创建本插件自有表，避免把 astrbot 全局 SQLModel.metadata 的其它表
-        # 一并建进独立库。
-        async with self._engine.begin() as conn:
-            # 启用 WAL 模式（并发读写性能提升，减少 database is locked）
-            await conn.execute(text("PRAGMA journal_mode=WAL"))
-            await conn.execute(text("PRAGMA busy_timeout=5000"))
-            await conn.execute(text("PRAGMA synchronous=NORMAL"))
-            await conn.run_sync(
-                lambda sync_conn: SQLModel.metadata.create_all(
-                    sync_conn,
-                    tables=[
-                        CostSupplement.__table__,  # type: ignore[attr-defined]
-                        CacheEvent.__table__,  # type: ignore[attr-defined]
-                    ],
-                    checkfirst=True,
+        try:
+            # 仅创建本插件自有表，避免把 astrbot 全局 SQLModel.metadata 的其它表
+            # 一并建进独立库。
+            async with engine.begin() as conn:
+                # 启用 WAL 模式（并发读写性能提升，减少 database is locked）
+                await conn.execute(text("PRAGMA journal_mode=WAL"))
+                await conn.execute(text("PRAGMA busy_timeout=5000"))
+                await conn.execute(text("PRAGMA synchronous=NORMAL"))
+                await conn.run_sync(
+                    lambda sync_conn: SQLModel.metadata.create_all(
+                        sync_conn,
+                        tables=[
+                            CostSupplement.__table__,  # type: ignore[attr-defined]
+                            CacheEvent.__table__,  # type: ignore[attr-defined]
+                        ],
+                        checkfirst=True,
+                    )
                 )
-            )
-            # 幂等迁移：补齐新加的列与索引（旧库只有旧 schema 时必要）。
-            await self._migrate_supplement_columns(conn)
+                # 幂等迁移：补齐新加的列与索引（旧库只有旧 schema 时必要）。
+                await self._migrate_supplement_columns(conn)
+                cache_columns = {
+                    row[1]
+                    for row in (await conn.execute(text("PRAGMA table_info(cache_events)"))).all()
+                }
+                # 缓存诊断前后快照是后增字段，旧表也需要迁移才能继续读写。
+                for column in ("before", "after"):
+                    if column not in cache_columns:
+                        await conn.execute(
+                            text(f'ALTER TABLE cache_events ADD COLUMN "{column}" TEXT')
+                        )
+        except BaseException:
+            await engine.dispose()
+            raise
+        self._engine = engine
+        self._session_maker = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
 
     async def _migrate_supplement_columns(self, conn: Any) -> None:
         """幂等迁移：检查 ``cost_supplements`` 实际列，缺则 ``ALTER TABLE ADD COLUMN``。
@@ -179,7 +218,7 @@ class StoreMixin:
         - ``user_id TEXT``（按用户 override 需要；索引由后续 ``CREATE INDEX IF NOT EXISTS`` 兜底）
         - ``request_id TEXT``（per_request 计费按 distinct request_id 计数；索引兜底）
 
-        任何 SQLite 错误吞掉（开发期重命名/删除列属人为操作，不应阻断）。
+        迁移失败向初始化调用方报告，避免发布缺列的数据库会话。
         """
         try:
             res = await conn.execute(text("PRAGMA table_info(cost_supplements)"))
@@ -230,8 +269,9 @@ class StoreMixin:
                 )
             )
         except Exception as e:
-            # 迁移失败不阻断；后续写入缺失字段会被 SQLAlchemy 兜底为 None
-            logger.warning("[cost_control] 数据库迁移失败（不影响运行）: %s", e)
+            # 缺列会使 ORM 的所有读写失败，不能把不完整 schema 当作初始化成功。
+            logger.warning("[cost_control] 数据库迁移失败: %s", e)
+            raise
 
     async def _ensure_session_maker(self) -> Any:
         if self._session_maker is None:
@@ -282,7 +322,7 @@ class StoreMixin:
         user_id: str | None = None,
         start: datetime | None = None,
         end: datetime | None = None,
-        limit: int = 100,
+        limit: int | None = 100,
         order_by: str = "created_at",
         order_dir: str = "desc",
     ) -> list[CostSupplement]:
@@ -402,23 +442,24 @@ class StoreMixin:
 
             maker = await self._ensure_session_maker()
             async with maker() as session:
+                total = func.coalesce(
+                    func.sum(
+                        CostSupplement.token_input_other
+                        + CostSupplement.token_input_cached
+                        + CostSupplement.token_output
+                    ),
+                    0,
+                )
                 stmt = (
-                    select(
-                        CostSupplement.user_id,
-                        func.coalesce(
-                            func.sum(
-                                CostSupplement.token_input_other
-                                + CostSupplement.token_input_cached
-                                + CostSupplement.token_output
-                            ),
-                            0,
-                        ),
-                    )
+                    select(CostSupplement.user_id, total)
                     .where(CostSupplement.user_id.is_not(None))
+                    .where(CostSupplement.user_id != "")
                     .group_by(CostSupplement.user_id)
-                    .order_by(func.sum(CostSupplement.token_input_other).desc())
+                    .order_by(total.desc(), CostSupplement.user_id.asc())
                     .limit(limit)
                 )
+                if start:
+                    stmt = stmt.where(CostSupplement.created_at >= start)
                 rows = (await session.execute(stmt)).all()
                 return [(str(r[0]), int(r[1] or 0)) for r in rows]
         except Exception as e:
@@ -470,6 +511,15 @@ class StoreMixin:
                     model = getattr(r, "provider_model", None)
                     created_at = getattr(r, "created_at", None)
                     rule = resolve_effective_pricing(provider_id, model, pricing, created_at)
+                    frozen_cost = getattr(r, "cost_amount", None)
+                    if frozen_cost is not None and (rule or {}).get("mode") != "per_request":
+                        total += _convert(
+                            float(frozen_cost),
+                            str(getattr(r, "currency_symbol", None) or "USD"),
+                            main_cur,
+                            _rates,
+                        )
+                        continue
                     if rule is None:
                         continue
                     cur = str(rule.get("currency", "USD") or "USD").strip().upper() or "USD"

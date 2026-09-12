@@ -4,7 +4,21 @@
 
 格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/),版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [Unreleased]
+## [0.4.1] - 2026-09-12
+
+**全面审查修复版本**：修复覆盖入口钩子、计费、预算、存储、报表、Web API 与前端面板的 51 项一致性缺陷，完整问题清单及验证边界见 [AUDIT.md](AUDIT.md)；同版本包含峰谷分时定价层，安装要求统一为 AstrBot >=4.25.5。
+
+### 全面代码审查修复（2026-09-06）
+
+- 修复总开关/平台范围失效、同会话归因串用和响应模型归集错误。
+- 修复缓存用量划分、跨货币价格继承、非线性定价跨调用汇总、免费服务档及非法动态成本；强化表达式资源限制。
+- 修复全局备用 Provider 不生效、降级重复调用与统计漏记、用户预算时间窗口及历史成本口径。
+- 修复并发通知、数据库初始化/旧表迁移、夏令时边界和报表样本截断。
+- 修复自动保存与刷新竞争、设置字段绑定、部分配置覆盖、清空操作协议及汇率保存失败误报；对无效价格严格拒绝写入。
+- 修复 AI 诊断预算币种/局部花费与输出结构、命令部分失败、缓存诊断结构漏检及价格源同步隔离。
+- 增加真实 SQLite、并发、入口钩子、ReactDOM 生命周期与界面回归；重建插件面板静态产物。
+- 补齐工具循环请求的累计 Token 采集兼容路径，并在卸载时撤销本实例 Cron、关闭数据库连接池；明确宿主逐轮数据缺失的统计边界。
+- 统一安装声明为 AstrBot >=4.25.5；完整问题清单及验证边界见 [AUDIT.md](AUDIT.md)。
 
 ### 新增
 
@@ -288,3 +302,4 @@
 [0.2.1]: https://github.com/leafliber/astrbot_plugin_cost_control/releases/tag/v0.2.1
 [0.3.0]: https://github.com/leafliber/astrbot_plugin_cost_control/releases/tag/v0.3.0
 [0.4.0]: https://github.com/leafliber/astrbot_plugin_cost_control/releases/tag/v0.4.0
+[0.4.1]: https://github.com/leafliber/astrbot_plugin_cost_control/releases/tag/v0.4.1

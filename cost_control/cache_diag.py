@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import difflib
 import hashlib
+import json
 from typing import Any
 
 from astrbot.api.provider import ProviderRequest
@@ -34,7 +35,8 @@ from .config import get_config
 def _hash_text(s: Any) -> str:
     """对文本取确定性短 hash（md5 前 8 位），用于跨轮对比（纯函数）。"""
     try:
-        return hashlib.md5(str(s).encode("utf-8", errors="ignore")).hexdigest()[:8]
+        text = json.dumps(s, ensure_ascii=False, sort_keys=True, default=str)
+        return hashlib.sha256(text.encode("utf-8", errors="ignore")).hexdigest()[:16]
     except Exception:
         return ""
 
@@ -203,8 +205,8 @@ def diagnose_changes(
             )
 
     if on("detect_system_prompt_change"):
-        if current.get("system_hash") and last.get("system_hash"):
-            if current["system_hash"] != last["system_hash"]:
+        if current.get("system_hash") or last.get("system_hash"):
+            if current.get("system_hash") != last.get("system_hash"):
                 ev_after = dict(after)
                 sd = _line_diff(last.get("system_text"), current.get("system_text"))
                 if sd is not None:
@@ -305,12 +307,23 @@ class CacheDiagMixin:
             system = getattr(req, "system_prompt", "") or ""
             func_tool = getattr(req, "func_tool", None)
             contexts = list(getattr(req, "contexts", None) or [])
-            contexts_hashes = [
-                _hash_text(m.get("content") if isinstance(m, dict) else m) for m in contexts
-            ]
+            contexts_hashes = [_hash_text(m) for m in contexts]
+            # 展示文本会裁切长行且省略 enum/nested schema，不能用作完整缓存键。
+            schema = getattr(func_tool, "openai_schema", None)
+            if callable(schema):
+                tools_signature = schema()
+            else:
+                tools_signature = [
+                    t if isinstance(t, dict) else {
+                        "name": getattr(t, "name", ""),
+                        "description": getattr(t, "description", ""),
+                        "parameters": getattr(t, "parameters", {}),
+                    }
+                    for t in (func_tool or [])
+                ]
             return {
                 "system_hash": _hash_text(system) if system else "",
-                "tools_hash": _hash_text(_format_tools(func_tool)) if func_tool is not None else "",
+                "tools_hash": _hash_text(tools_signature) if tools_signature else "",
                 "contexts_hashes": contexts_hashes,
                 "history_len": len(contexts),
                 "system_text": system,

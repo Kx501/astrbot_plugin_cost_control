@@ -52,6 +52,30 @@ async function post<T>(endpoint: string, body?: unknown): Promise<T> {
   return extractData<T>(await bridge.apiPost(endpoint, body));
 }
 
+// Configuration readers wait for locally initiated mutations and retry if a
+// mutation started while the response was in flight. This also covers switching
+// tabs while the old page flushes its draft on unmount.
+let configWrite: Promise<unknown> = Promise.resolve();
+let configRevision = 0;
+
+function mutateConfig<T>(write: () => Promise<T>): Promise<T> {
+  configRevision += 1;
+  const pending = configWrite.catch(() => {}).then(write);
+  configWrite = pending;
+  return pending;
+}
+
+async function readConfig<T>(endpoint: string): Promise<T> {
+  for (;;) {
+    const pending = configWrite;
+    await pending.catch(() => {});
+    if (pending !== configWrite) continue;
+    const revision = configRevision;
+    const value = await get<T>(endpoint);
+    if (revision === configRevision) return value;
+  }
+}
+
 export const api = {
   // overview
   getOverview: (window: Window) => get<OverviewReport>("overview", { window }),
@@ -69,7 +93,7 @@ export const api = {
     get<RecordsAggregate>("records/aggregate", params),
 
   // budgets
-  getBudgets: () => get<BudgetResponse>("budgets"),
+  getBudgets: () => readConfig<BudgetResponse>("budgets"),
   getProviders: () => get<{ providers: Provider[] }>("providers"),
 
   // cache / attribution / pricing / config
@@ -80,32 +104,50 @@ export const api = {
       "attribution",
       limit != null ? { window, limit } : { window },
     ),
-  getPricing: () => get<PricingResponse>("pricing"),
-  getConfig: () => get<Record<string, unknown>>("config"),
+  getPricing: () => readConfig<PricingResponse>("pricing"),
+  getConfig: () => readConfig<Record<string, unknown>>("config"),
 
   // actions
   postCleanup: () => post<{ deleted: number; message?: string }>("actions/cleanup"),
   postPurge: (modules: string[]) =>
     post<{ results: Record<string, number> }>("actions/purge", {
       modules,
+      confirm: "PURGE",
     }),
   postDeleteProviderData: (providerId: string) =>
-    post<DeleteProviderDataResult>("actions/delete_provider_data", {
+    mutateConfig(() => post<DeleteProviderDataResult>("actions/delete_provider_data", {
       provider_id: providerId,
       confirm: "DELETE_PROVIDER_DATA",
-    }),
+    })),
   postReport: () => post<{ message: string }>("actions/report"),
   postSaveConfig: (body: unknown) =>
-    post<{ saved: string[]; config: Record<string, unknown> }>(
+    mutateConfig(() => post<{ saved: string[]; config: Record<string, unknown> }>(
       "actions/save_config",
       body,
-    ),
+    )),
+  postPriceSource: (sourceId: string, patch: Record<string, unknown>) =>
+    mutateConfig(async () => {
+      // Read inside the writer queue so simultaneous source toggles cannot replace
+      // each other with copies of the same stale source map.
+      const cfg = await get<Record<string, unknown>>("config");
+      const sources = { ...((cfg.price_sources as Record<string, unknown>) ?? {}) };
+      const previous = (sources[sourceId] as Record<string, unknown>) ?? {};
+      const next = { ...previous, ...patch };
+      if (sourceId.startsWith("newapi:")) {
+        next.provider_id = previous.provider_id || patch.provider_id || sourceId.slice(7);
+        if (!("use_provider_key" in next)) next.use_provider_key = true;
+      }
+      sources[sourceId] = next;
+      return post<{ saved: string[]; config: Record<string, unknown> }>(
+        "actions/save_config", { price_sources: sources },
+      );
+    }),
   postSyncRates: () =>
-    post<{
+    mutateConfig(() => post<{
       exchange_rates: Record<string, number>;
       exchange_rates_updated_at: string;
       count: number;
-    }>("actions/sync_rates"),
+    }>("actions/sync_rates")),
   // 多源价格目录（F1/F2/F3）
   postPricingSync: (sources?: string[]) =>
     post<SyncReport>("pricing/sync", sources ? { sources } : {}),
@@ -119,9 +161,9 @@ export const api = {
     provider_id: string;
     model: string;
     price_key: string;
-  }) => post<{ selected: PriceSelection }>("pricing/select", body),
+  }) => mutateConfig(() => post<{ selected: PriceSelection }>("pricing/select", body)),
   postPricingSelectReset: (body: { provider_id: string; model?: string }) =>
-    post<{ removed: number }>("pricing/select/reset", body),
+    mutateConfig(() => post<{ removed: number }>("pricing/select/reset", body)),
   postPricingDetect: (provider_id: string) =>
     post<DetectResult>("pricing/sources/detect", { provider_id }),
   postPricingExprValidate: (expr: string) =>

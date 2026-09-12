@@ -2,7 +2,7 @@ import { useState, type ReactNode } from "react";
 import type { PricingCluster } from "../lib/types";
 
 function parseMultiplier(raw: string): number {
-  const value = Number(raw);
+  const value = Number(raw.trim() || "1");
   return Number.isFinite(value) && value >= 0 && value <= 100 ? value : 1;
 }
 
@@ -121,7 +121,7 @@ export function PricingCatalog({
                   onMultiplierChange(selected.id, event.target.value)
                 }
                 onBlur={() => {
-                  const value = Number(rawMultiplier);
+                  const value = Number(rawMultiplier.trim() || "1");
                   if (!Number.isFinite(value) || value < 0 || value > 100) {
                     onMultiplierChange(selected.id, "1");
                   }

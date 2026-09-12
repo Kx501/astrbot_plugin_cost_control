@@ -101,7 +101,23 @@ def _convert_parens(s: str) -> str:
             if depth != 0:
                 raise ValueError("括号不匹配")
             inner = s[i + 1 : j - 1]
-            out.append("(" + _convert_ternary(inner) + ")")
+            # 函数的每个参数是独立表达式，逗号不能被吞进三元条件或分支。
+            args: list[str] = []
+            begin = depth_inner = 0
+            for index, char in enumerate(inner):
+                if char in "([":
+                    depth_inner += 1
+                elif char in ")]":
+                    depth_inner -= 1
+                elif char == "," and depth_inner == 0:
+                    args.append(_convert_ternary(inner[begin:index]))
+                    begin = index + 1
+            if args:
+                args.append(_convert_ternary(inner[begin:]))
+                converted = ", ".join(args)
+            else:
+                converted = _convert_ternary(inner)
+            out.append("(" + converted + ")")
             i = j
         else:
             out.append(s[i])
@@ -256,24 +272,29 @@ class _SafeStr(str):
     时与普通 str 完全兼容。
     """
 
+    def __new__(cls, value: str) -> _SafeStr:
+        if len(value) > _MAX_STR_LEN:
+            raise ValueError(f"字符串运算结果过长（>{_MAX_STR_LEN} 字符）")
+        return str.__new__(cls, value)
+
     def _guard(self, length: int) -> None:
         if length > _MAX_STR_LEN:
             raise ValueError(f"字符串运算结果过长（>{_MAX_STR_LEN} 字符）")
 
-    def __mul__(self, other: Any) -> "_SafeStr":
+    def __mul__(self, other: Any) -> _SafeStr:
         n = int(other)
         self._guard(len(self) * abs(n))
         return _SafeStr(str.__mul__(self, n))
 
-    def __rmul__(self, other: Any) -> "_SafeStr":
+    def __rmul__(self, other: Any) -> _SafeStr:
         return self.__mul__(other)
 
-    def __add__(self, other: Any) -> "_SafeStr":
-        result = _SafeStr(str.__add__(self, other))
-        self._guard(len(result))
-        return result
+    def __add__(self, other: Any) -> _SafeStr:
+        if isinstance(other, str):
+            self._guard(len(self) + len(other))
+        return _SafeStr(str.__add__(self, other))
 
-    def __radd__(self, other: Any) -> "_SafeStr":
+    def __radd__(self, other: Any) -> _SafeStr:
         return _SafeStr(other).__add__(self) if isinstance(other, str) else NotImplemented
 
 
@@ -312,7 +333,13 @@ def _check_node(node: ast.AST) -> None:
                 raise ValueError("仅允许调用白名单函数")
         if isinstance(sub, ast.Name) and sub.id.startswith("__"):
             raise ValueError("不允许双下划线标识符")
-        if isinstance(sub, ast.Constant) and isinstance(sub.value, str) and len(sub.value) > _MAX_STR_LEN:
+        if isinstance(sub, ast.Name) and sub.id not in _VARIABLE_NAME_SET | _ALLOWED_FUNCS:
+            raise ValueError(f"未知变量或函数：{sub.id}")
+        if (
+            isinstance(sub, ast.Constant)
+            and isinstance(sub.value, str)
+            and len(sub.value) > _MAX_STR_LEN
+        ):
             raise ValueError(f"字符串字面量过长（>{_MAX_STR_LEN} 字符）")
 
 
@@ -330,7 +357,7 @@ class _StrPlaceholderTransformer(ast.NodeTransformer):
         return node
 
 
-def _wrap_str_constants(tree: ast.Expression) -> dict[str, "_SafeStr"]:
+def _wrap_str_constants(tree: ast.Expression) -> dict[str, _SafeStr]:
     """把树中所有 str 常量替换为占位符 Name（``_sN``），返回占位符映射。
 
     ``ast.Constant`` 只接受精确的内置类型（子类会让 ``compile`` 报错），因此用
@@ -407,7 +434,10 @@ def _parse_tz(tz: Any) -> tzinfo:
     if tz is None or tz == "" or tz == "Z":
         return UTC
     if isinstance(tz, (int, float)):
-        return timezone(timedelta(hours=float(tz)))
+        try:
+            return timezone(timedelta(hours=float(tz)))
+        except (ValueError, OverflowError):
+            return UTC
     s = str(tz).strip()
     try:
         if ":" in s:
@@ -430,29 +460,30 @@ def _parse_tz(tz: Any) -> tzinfo:
 
 
 def _context_dt(context: dict[str, Any], tz: Any) -> datetime:
-    """从 context.created_at 构造指定时区 datetime；缺失/异常回退当前时刻。
+    """从 context.created_at 构造指定时区 datetime；缺失/异常显式失败。
 
     ``created_at`` 同时接受 epoch 秒（历史口径）与 ``datetime`` 对象（supplement
-    新写入口径）；naive datetime 视为 UTC。
+    新写入口径）及 ISO 字符串；naive datetime 视为 UTC。不能用当前时间替代历史
+    计费时刻，否则同一条记录会随报表查询时间改变金额。
     """
     resolved = _parse_tz(tz)
     created = context.get("created_at") if isinstance(context, dict) else None
+    if isinstance(created, str):
+        try:
+            created = datetime.fromisoformat(created.strip())
+        except ValueError:
+            pass  # 兼容以字符串保存的 epoch 秒。
     if isinstance(created, datetime):
         dt = created if created.tzinfo is not None else created.replace(tzinfo=UTC)
         try:
             return dt.astimezone(resolved)
-        except Exception:
-            return datetime.now(resolved)
+        except (ValueError, OverflowError) as exc:
+            raise ValueError("时间表达式缺少有效 created_at") from exc
     try:
-        ts = float(created or 0)
-    except Exception:
-        ts = 0.0
-    if ts <= 0:
-        return datetime.now(resolved)
-    try:
+        ts = float(created)
         return datetime.fromtimestamp(ts, resolved)
-    except Exception:
-        return datetime.now(resolved)
+    except (TypeError, ValueError, OverflowError, OSError) as exc:
+        raise ValueError("时间表达式缺少有效 created_at") from exc
 
 
 def eval_tiered_expr(
@@ -486,7 +517,7 @@ def eval_tiered_expr(
         k = str(key).lower()
         for hk, hv in headers.items():
             if str(hk).lower() == k:
-                return str(hv)
+                return _SafeStr(str(hv))
         # 只记录请求头键名，绝不记录值；帮助排查 request-rule 表达式的头名拼写。
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
@@ -517,7 +548,7 @@ def eval_tiered_expr(
                         path,
                         sorted(str(k) for k in scope.keys()),
                     )
-                return cur
+                return _SafeStr(cur) if isinstance(cur, str) else cur
         if logger.isEnabledFor(logging.DEBUG):
             keys: set[str] = set()
             for scope_key, scope_v in (
@@ -555,8 +586,17 @@ def eval_tiered_expr(
 
     code, str_consts = _compile(expr)
     # 字符串字面量经 globals 注入 _SafeStr 代理，封顶重复/拼接长度。
-    result = eval(code, {"__builtins__": {}, **str_consts}, dict(namespace))  # 白名单 AST 已限制可执行范围
-    return float(result), trace.matched_tier
+    result = eval(
+        code, {"__builtins__": {}, **str_consts}, dict(namespace)
+    )  # 白名单 AST 已限制可执行范围
+    value = float(result)
+    # 保存时的有限测试向量无法覆盖所有请求上下文与分支，运行时仍须把异常
+    # 金额转为显式失败，避免写入负成本或 NaN/Inf 并污染预算与报表。
+    if not math.isfinite(value):
+        raise ValueError("表达式结果为 NaN/Inf")
+    if value < 0:
+        raise ValueError("表达式结果不能为负")
+    return value, trace.matched_tier
 
 
 # ---- 验证（保存前 smoke test）----

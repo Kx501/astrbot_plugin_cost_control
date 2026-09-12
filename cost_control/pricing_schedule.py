@@ -36,11 +36,17 @@ def _minute_of_day(value: Any) -> int | None:
 
 
 def _normalize_weekdays(value: Any, *, strict: bool, label: str) -> list[int] | None:
+    if value is not None and not isinstance(value, (list, tuple, set)):
+        _fail(f"{label}.weekdays 必须是 1–7 的数组", strict=strict)
+        return None
     raw = value if isinstance(value, (list, tuple, set)) else []
     if not raw:
         raw = list(range(1, 8))
     out: list[int] = []
     for item in raw:
+        if isinstance(item, bool) or not isinstance(item, (int, str)):
+            _fail(f"{label}.weekdays 必须是 1–7 的整数数组", strict=strict)
+            return None
         try:
             day = int(item)
         except (TypeError, ValueError):
